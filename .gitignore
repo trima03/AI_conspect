@@ -1,0 +1,25 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Local data and audio (may contain private recordings)
+data/
+recordings/
+*.mp3
+*.wav
+*.m4a
+*.aac
+*.flac
+
+# Common generated files
+.DS_Store
+Thumbs.db
+__pycache__/
+.venv/
+venv/
+node_modules/
+dist/
+build/
+.idea/
+.vscode/
