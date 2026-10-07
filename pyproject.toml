@@ -7,7 +7,7 @@ name = "ai-conspect"
 version = "0.1.0"
 description = "Speech transcription prototype for AI_conspect"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = ["certifi>=2024.2.2"]
 
 [project.scripts]
 transcribe-lesson = "konspekt.transcribe:main"

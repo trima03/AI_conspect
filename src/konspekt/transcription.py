@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
+import ssl
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +17,7 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+import certifi
 
 API_URL = "https://api.openai.com/v1/audio/transcriptions"
 DEFAULT_MODEL = "gpt-transcribe"
@@ -120,7 +122,12 @@ def transcribe_audio(
     )
 
     try:
-        with urlopen(request, timeout=timeout_seconds) as response:
+        # Some macOS Python builds do not automatically use the system keychain.
+        # certifi provides a maintained CA bundle while keeping TLS verification on.
+        tls_context = ssl.create_default_context(cafile=certifi.where())
+        with urlopen(
+            request, timeout=timeout_seconds, context=tls_context
+        ) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except HTTPError as error:
         details = error.read().decode("utf-8", errors="replace")

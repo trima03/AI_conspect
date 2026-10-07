@@ -16,6 +16,7 @@ recordings/
 .DS_Store
 Thumbs.db
 __pycache__/
+*.egg-info/
 .venv/
 venv/
 node_modules/
