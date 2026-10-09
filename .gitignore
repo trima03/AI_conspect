@@ -11,6 +11,8 @@ recordings/
 *.m4a
 *.aac
 *.flac
+*.sqlite3
+*.db
 
 # Common generated files
 .DS_Store
