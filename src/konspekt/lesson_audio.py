@@ -1,21 +1,28 @@
-"""Привязка аудиофайла к существующему уроку.
+"""Связь аудиофайлов с уроками: файлы на диске + записи в SQLite.
 
-Что делает модуль (функция attach_audio_to_lesson):
-    1. проверяет, что урок есть в базе;
-    2. копирует аудио в data/audio/ через audio.save_audio();
-    3. записывает путь к копии в урок (в SQLite);
-    4. если запись в базу не удалась, удаляет только что созданную копию.
+Две функции:
+
+    create_lesson_with_audio(subject_id, title, source_path)
+        создаёт НОВЫЙ урок сразу с аудио одной операцией;
+
+    attach_audio_to_lesson(lesson_id, source_path)
+        привязывает аудио к УЖЕ существующему уроку.
+
+В обеих функциях порядок один: сначала всё проверяется, потом создаётся копия
+аудио в data/audio/ и только потом пишется запись в базу. Если запись в базу
+не удалась, только что созданная копия удаляется.
 
 Исходный файл не изменяется и не удаляется. Модуль не обращается к интернету
-и не запускает распознавание речи. Остальные поля урока (статус, текст,
-конспект, ошибка) не меняются.
+и не запускает распознавание речи.
 
 Пример:
-    from konspekt import lesson_audio, storage
+    from konspekt import audio, lesson_audio, storage
 
     try:
-        lesson = lesson_audio.attach_audio_to_lesson(5, "C:/Users/me/lesson.mp3")
-    except (audio.AudioError, storage.StorageError) as error:
+        lesson = lesson_audio.create_lesson_with_audio(
+            1, "Законы Ньютона", "C:/Users/me/lesson.mp3"
+        )
+    except (audio.AudioError, storage.StorageError, ValueError) as error:
         print(error)  # понятное сообщение на русском
 
 Код совместим с Python 3.10 и новее, сторонние библиотеки не нужны.
@@ -45,6 +52,67 @@ def _remove_copy(copy_path: Path) -> bool:
         return True
     except OSError:
         return False
+
+
+def _cleanup_after_failed_write(error: BaseException, copy_path: Path) -> None:
+    """Вызывается, когда запись в базу не удалась, а копия аудио уже создана.
+
+    Удаляет копию. Если причина сбоя ошибка SQLite, превращает её в понятную
+    StorageError (и сообщает, удалась ли уборка). Для любых других ошибок
+    ничего не выбрасывает: вызывающая функция сама пробросит исходную ошибку.
+    """
+    removed = _remove_copy(copy_path)
+    if isinstance(error, sqlite3.Error):
+        if removed:
+            tail = "Созданная копия аудио удалена."
+        else:
+            tail = (
+                f"Не удалось удалить копию «{copy_path.name}», "
+                "она осталась в папке аудио."
+            )
+        raise storage.StorageError(
+            f"Не удалось сохранить урок в базе данных: {error}. {tail}"
+        ) from error
+
+
+def create_lesson_with_audio(
+    subject_id: int, title: str, source_path: str | os.PathLike[str]
+) -> storage.Lesson:
+    """Создаёт урок с аудио одной операцией и возвращает созданный урок.
+
+    Порядок действий:
+        1. проверяется предмет;
+        2. проверяется название урока;
+        3. проверяется аудиофайл и делается его копия в data/audio/;
+        4. в базе создаётся урок со статусом queued и путём к копии.
+
+    Возможные ошибки (все с текстом на русском):
+        storage.NotFoundError            предмета с таким номером нет;
+        ValueError                       название урока пустое;
+        audio.AudioError и его виды      файл не подходит (нет файла, формат,
+                                         размер) или копирование не удалось;
+        storage.StorageError             не удалось сохранить урок в базе.
+
+    Урок записывается в базу только после того, как копия аудио полностью
+    создана. Поэтому записи об уроке без аудиофайла появиться не может.
+    Если запись в базу не удалась, копия удаляется.
+    """
+    # 1. Предмет должен существовать (NotFoundError, если нет).
+    storage.get_subject(subject_id)
+
+    # 2. Название проверяем ДО копирования, чтобы не копировать файл зря.
+    if not isinstance(title, str) or not title.strip():
+        raise ValueError("Название урока не может быть пустым.")
+
+    # 3. Копия аудио (здесь же проверяются существование, формат и размер).
+    copy_path = audio.save_audio(source_path)
+
+    # 4. Запись урока в базу. При любом сбое убираем созданную копию.
+    try:
+        return storage.create_lesson(subject_id, title, copy_path)
+    except BaseException as error:
+        _cleanup_after_failed_write(error, copy_path)
+        raise
 
 
 def attach_audio_to_lesson(
