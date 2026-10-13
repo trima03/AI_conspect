@@ -7,7 +7,7 @@ import sqlite3
 from pathlib import Path
 
 from . import storage
-from .transcription import TranscriptionError, transcribe_audio
+from .transcription import TranscriptionError, DEFAULT_MODEL, transcribe_audio
 
 
 def main(argv=None) -> int:
@@ -17,7 +17,7 @@ def main(argv=None) -> int:
     source.add_argument("--lesson-id", type=int, help="Распознать и сохранить существующий урок")
     parser.add_argument("--language", default="ru")
     parser.add_argument("--prompt", help="Термины и контекст урока")
-    parser.add_argument("--model", choices=("tiny", "small"), default="small")
+    parser.add_argument("--model", choices=("turbo", "tiny", "small"), default=DEFAULT_MODEL)
     parser.add_argument("--backend", choices=("auto", "mlx", "cpu"), default="auto")
     parser.add_argument("--output", type=Path, help="Сохранить текст в новый файл UTF-8")
     args = parser.parse_args(argv)

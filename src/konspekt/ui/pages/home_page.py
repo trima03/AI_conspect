@@ -23,6 +23,7 @@ class HomePage(ScrollPage):
     # Страница не знает, как добавлять лекции: она только сообщает об этом окну.
     add_lesson_requested = Signal()
     lesson_requested = Signal(int)
+    delete_requested = Signal(int)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -155,6 +156,9 @@ class HomePage(ScrollPage):
             button = QPushButton("Открыть")
             button.clicked.connect(lambda checked=False, ident=item.id: self.lesson_requested.emit(ident))
             row.layout().addWidget(button)
+            delete = QPushButton("Удалить")
+            delete.clicked.connect(lambda checked=False, ident=item.id: self.delete_requested.emit(ident))
+            row.layout().addWidget(delete)
             self._rows_layout.addWidget(row)
         self._hint_label.show()
 

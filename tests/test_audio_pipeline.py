@@ -175,6 +175,24 @@ class LocalAudioTests(unittest.TestCase):
                 recording.record_audio(threading.Event(), directory=self.root / 'capture')
         self.assertFalse((self.root / 'capture').exists())
 
+    def test_long_chunk_prefers_silence_and_never_cuts_last_tail(self):
+        samples = np.ones(12 * transcription.SAMPLE_RATE, dtype=np.float32) * .1
+        samples[-2 * transcription.SAMPLE_RATE:-transcription.SAMPLE_RATE] = 0
+        cut = transcription._chunk_cut(samples, is_final=False)
+        self.assertLess(cut, len(samples))
+        self.assertGreaterEqual(cut, len(samples) - 3 * transcription.SAMPLE_RATE)
+        self.assertEqual(transcription._chunk_cut(samples, is_final=True), len(samples))
+        self.assertEqual(transcription._chunk_cut(np.ones_like(samples), is_final=False), len(samples))
+
+    def test_background_noise_is_not_transcribed_as_speech(self):
+        with wave.open(str(self.wav), 'wb') as output:
+            output.setnchannels(1); output.setsampwidth(2); output.setframerate(16000)
+            output.writeframes(np.ones(16000, dtype='<i2').tobytes())
+        with patch.object(transcription, '_recognize') as model:
+            with self.assertRaisesRegex(transcription.TranscriptionError, 'Речь не обнаружена'):
+                transcription.transcribe_audio(self.wav)
+            model.assert_not_called()
+
 
 if __name__ == '__main__':
     unittest.main()

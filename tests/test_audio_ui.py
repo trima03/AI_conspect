@@ -109,6 +109,70 @@ class AudioUITests(unittest.TestCase):
         self.assertIsNone(lesson.transcript)
         self.assertTrue(self.dialog.transcribe.isEnabled())
 
+    def test_save_without_transcription_appears_in_subject(self):
+        other = storage.create_subject('История')
+        dialog = AudioDialog(subject_id=other.id, source_path=str(self.wav))
+        dialog.title.setText('Новая запись')
+        with patch.object(pipeline, 'transcribe_audio') as engine:
+            dialog._save()
+            engine.assert_not_called()
+        self.assertEqual(storage.list_lessons(other.id)[0].id, dialog.lesson_id)
+        self.assertEqual(storage.get_lesson(dialog.lesson_id).status, storage.STATUS_QUEUED)
+        from konspekt.ui.pages.subjects_page import SubjectsPage
+        page = SubjectsPage(); page.refresh()
+        page.subjects.setCurrentIndex(page.subjects.findData(other.id))
+        self.assertEqual(page.rows.count(), 1)
+        self.assertIn('(1)', page.subjects.currentText())
+        dialog.close(); page.close()
+
+    def test_audio_deletion_keeps_text_and_allows_replacement(self):
+        from PySide6.QtWidgets import QMessageBox
+        from konspekt import library
+        self.dialog._save()
+        storage.save_lesson_transcript(self.dialog.lesson_id, 'Прежний текст')
+        dialog = AudioDialog(self.dialog.lesson_id)
+        with patch.object(QMessageBox, 'question', return_value=QMessageBox.StandardButton.No):
+            dialog._delete_audio()
+        self.assertIsNotNone(dialog.source)
+        with patch.object(QMessageBox, 'question', return_value=QMessageBox.StandardButton.Yes):
+            dialog._delete_audio()
+        self.assertEqual(storage.get_lesson(dialog.lesson_id).transcript, 'Прежний текст')
+        self.assertIsNone(dialog.source)
+        self.assertTrue(dialog.choose.isEnabled())
+        self.assertFalse(dialog.transcribe.isEnabled())
+        dialog._set_source(self.wav)
+        dialog._save()
+        self.assertTrue(Path(storage.get_lesson(dialog.lesson_id).audio_path).exists())
+        # The old audio can no longer overwrite a newly attached recording.
+        with self.assertRaises(storage.StorageError):
+            library.restore_item(library.list_trash()[0].id)
+        dialog.close()
+
+    def test_delete_and_restore_updates_all_pages(self):
+        from PySide6.QtWidgets import QMessageBox
+        from konspekt import library
+        self.dialog._save()
+        window = MainWindow()
+        window._subjects_page.refresh()
+        self.assertIn('(1)', window._subjects_page.subjects.currentText())
+        with patch.object(QMessageBox, 'question', return_value=QMessageBox.StandardButton.Yes):
+            window._delete_lesson(self.dialog.lesson_id)
+        self.assertIn('(0)', window._subjects_page.subjects.currentText())
+        self.assertEqual(window._home_page._lessons_value.text(), '0')
+        entry = library.list_trash()[0]
+        window._restore(entry.id)
+        self.assertIn('(1)', window._subjects_page.subjects.currentText())
+        self.assertEqual(window._home_page._lessons_value.text(), '1')
+        window.close()
+
+    def test_moving_lecture_subject_from_dialog(self):
+        self.dialog._save()
+        other = storage.create_subject('Физика')
+        self.dialog._load_subjects(other.id)
+        self.dialog._save()
+        self.assertEqual(storage.get_lesson(self.dialog.lesson_id).subject_id, other.id)
+
+
 
 if __name__ == '__main__':
     unittest.main()

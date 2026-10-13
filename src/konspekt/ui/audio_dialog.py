@@ -5,13 +5,14 @@ import logging
 import threading
 from pathlib import Path
 
-from PySide6.QtCore import QThread, Signal, Qt
+from PySide6.QtCore import QThread, Signal, Qt, QUrl
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QComboBox, QDialog, QFileDialog, QFormLayout, QHBoxLayout, QInputDialog,
     QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton, QTextEdit, QVBoxLayout,
 )
 
-from .. import lesson_audio, storage
+from .. import lesson_audio, storage, library
 from ..pipeline import transcribe_lesson
 from ..recording import RecordingError, list_input_devices, record_audio
 from ..transcription import MAX_FILE_BYTES, TranscriptionCancelled
@@ -41,7 +42,7 @@ class AudioJob(QThread):
 class AudioDialog(QDialog):
     lesson_changed = Signal()
 
-    def __init__(self, lesson_id: int | None = None, parent=None):
+    def __init__(self, lesson_id: int | None = None, parent=None, *, subject_id=None, source_path=None):
         super().__init__(parent)
         self.setWindowTitle("Запись и расшифровка лекции")
         self.resize(780, 720)
@@ -50,6 +51,7 @@ class AudioDialog(QDialog):
         self.job = None
         self.mode = None
         self._auto_transcribe = False
+        self._replace_audio = False
         root = QVBoxLayout(self)
         form = QFormLayout()
         self.subjects = QComboBox()
@@ -63,8 +65,9 @@ class AudioDialog(QDialog):
         self.title.setPlaceholderText("Например, Производные — 13 октября")
         form.addRow("Название лекции", self.title)
         self.models = QComboBox()
-        self.models.addItem("Small — точнее", "small")
-        self.models.addItem("Tiny — быстрее, больше ошибок", "tiny")
+        self.models.addItem("Точное распознавание — Large v3 Turbo", "turbo")
+        self.models.addItem("Экономия памяти — Small", "small")
+        self.models.addItem("Tiny — только для проверки запуска", "tiny")
         form.addRow("Модель", self.models)
         self.context = QLineEdit()
         self.context.setPlaceholderText("Необязательно: фамилии, термины, тема")
@@ -127,7 +130,17 @@ class AudioDialog(QDialog):
         self.text.setPlaceholderText("Здесь появится расшифровка. Её можно будет исправить и сохранить.")
         root.addWidget(self.text, 1)
         footer = QHBoxLayout()
-        self.save = QPushButton("Сохранить правки")
+        deletion_row = QHBoxLayout()
+        self.play = QPushButton("Прослушать запись")
+        self.play.clicked.connect(self._play)
+        self.delete_audio = QPushButton("Удалить аудио")
+        self.delete_audio.clicked.connect(self._delete_audio)
+        self.delete_lesson = QPushButton("Удалить лекцию")
+        self.delete_lesson.clicked.connect(self._delete_lesson)
+        for button in (self.play, self.delete_audio, self.delete_lesson):
+            deletion_row.addWidget(button)
+        root.addLayout(deletion_row)
+        self.save = QPushButton("Сохранить лекцию")
         self.save.clicked.connect(self._save)
         self.export = QPushButton("Экспорт в TXT")
         self.export.clicked.connect(self._export)
@@ -136,15 +149,18 @@ class AudioDialog(QDialog):
         for widget in (self.save, self.export, self.close_button):
             footer.addWidget(widget)
         root.addLayout(footer)
-        self._load_subjects()
+        self._load_subjects(subject_id)
         if lesson_id is not None:
             lesson = storage.get_lesson(lesson_id)
             self.title.setText(lesson.title)
             self.subjects.setCurrentIndex(self.subjects.findData(lesson.subject_id))
-            self._set_source(Path(lesson.audio_path))
+            self._set_source(Path(lesson.audio_path) if lesson.audio_path else None)
+            self._replace_audio = not lesson.audio_path or not Path(lesson.audio_path).is_file()
             self.text.setPlainText(lesson.transcript or "")
             self.reset.setVisible(lesson.status == storage.STATUS_PROCESSING)
             self.state.setText(lesson.error_message or "Аудиозапись сохранена. Можно запустить распознавание повторно.")
+        if lesson_id is None and source_path:
+            self._set_source(Path(source_path))
         self._busy(False)
         self.text.textChanged.connect(lambda: self.export.setEnabled(self.job is None and bool(self.text.toPlainText().strip())))
 
@@ -167,7 +183,7 @@ class AudioDialog(QDialog):
 
     def _set_source(self, source):
         self.source = source
-        self.source_label.setText(str(source))
+        self.source_label.setText(str(source) if source else "Аудио не выбрано или удалено. Текст лекции сохранён.")
 
     def _choose_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "Выберите запись", "",
@@ -184,13 +200,18 @@ class AudioDialog(QDialog):
 
     def _busy(self, busy):
         existing = self.lesson_id is not None
-        for widget in (self.title, self.subjects, self.add_subject, self.choose, self.record, self.devices):
-            widget.setEnabled(not busy and not existing)
+        for widget in (self.title, self.subjects, self.add_subject):
+            widget.setEnabled(not busy)
+        for widget in (self.choose, self.record, self.devices):
+            widget.setEnabled(not busy and (not existing or self._replace_audio))
         for widget in (self.models, self.context):
             widget.setEnabled(not busy)
         self.text.setReadOnly(busy)
         self.transcribe.setEnabled(not busy and self.source is not None)
-        self.save.setEnabled(not busy and existing)
+        self.save.setEnabled(not busy and (existing or self.source is not None))
+        self.delete_lesson.setEnabled(not busy and existing)
+        self.delete_audio.setEnabled(not busy and self.source is not None)
+        self.play.setEnabled(not busy and self.source is not None and self.source.is_file())
         self.export.setEnabled(not busy and bool(self.text.toPlainText().strip()))
         self.close_button.setEnabled(not busy)
         self.progress.setVisible(busy)
@@ -247,6 +268,10 @@ class AudioDialog(QDialog):
                 lesson = lesson_audio.create_lesson_with_audio(subject_id, title, source, max_size_bytes=MAX_FILE_BYTES)
                 job.lesson_id = lesson.id
             else:
+                stored = storage.get_lesson(lesson_id)
+                if not stored.audio_path or Path(stored.audio_path).resolve() != source.resolve():
+                    lesson_audio.attach_audio_to_lesson(lesson_id, source, max_size_bytes=MAX_FILE_BYTES)
+                storage.update_lesson_details(lesson_id, subject_id, title)
                 job.lesson_id = lesson_id
             return transcribe_lesson(job.lesson_id, model=model, prompt=prompt,
                                      cancel_event=job.stop_event, progress=job.message.emit)
@@ -258,6 +283,9 @@ class AudioDialog(QDialog):
         self.job = None
         if job.lesson_id is not None:
             self.lesson_id = job.lesson_id
+            lesson = storage.get_lesson(self.lesson_id)
+            self._set_source(Path(lesson.audio_path) if lesson.audio_path else None)
+            self._replace_audio = not lesson.audio_path or not Path(lesson.audio_path).is_file()
         if job.error is not None:
             self.state.setText(str(job.error))
         elif mode == "record":
@@ -294,10 +322,61 @@ class AudioDialog(QDialog):
                 self.state.setText(str(error))
 
     def _save(self):
+        if not self._validate():
+            return
         try:
-            storage.save_lesson_transcript(self.lesson_id, self.text.toPlainText())
-            self.state.setText("Правки сохранены.")
+            if self.lesson_id is None:
+                if self.source is None:
+                    return
+                lesson = lesson_audio.create_lesson_with_audio(self.subjects.currentData(), self.title.text().strip(), self.source, max_size_bytes=MAX_FILE_BYTES)
+                self.lesson_id = lesson.id
+                self._set_source(Path(lesson.audio_path))
+            else:
+                stored = storage.get_lesson(self.lesson_id)
+                if self.source is not None and (not stored.audio_path or Path(stored.audio_path).resolve() != self.source.resolve()):
+                    lesson = lesson_audio.attach_audio_to_lesson(self.lesson_id, self.source, max_size_bytes=MAX_FILE_BYTES)
+                    self._set_source(Path(lesson.audio_path))
+                storage.update_lesson_details(self.lesson_id, self.subjects.currentData(), self.title.text())
+            self._replace_audio = self.source is None
+            if self.text.toPlainText().strip():
+                storage.save_lesson_transcript(self.lesson_id, self.text.toPlainText())
+            self._busy(False)
+            self.state.setText("Лекция сохранена в выбранном предмете.")
             self.lesson_changed.emit()
+        except Exception as error:
+            self.state.setText(str(error))
+
+    def _play(self):
+        if self.source and self.source.is_file():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.source.resolve())))
+
+    def _delete_audio(self):
+        if self.job is not None or self.source is None:
+            return
+        if QMessageBox.question(self, "Удалить аудио", "Переместить аудио приложения в корзину? Текст лекции останется сохранённым.", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            if self.lesson_id is not None:
+                library.archive_lesson(self.lesson_id, audio_only=True)
+            elif self.source.parent.resolve() == (storage.get_data_dir() / "recordings").resolve():
+                library.archive_recording(self.source)
+            self._set_source(None)
+            self._replace_audio = True
+            self._busy(False)
+            self.state.setText("Аудио убрано. Файлы приложения можно восстановить из корзины.")
+            self.lesson_changed.emit()
+        except Exception as error:
+            self.state.setText(str(error))
+
+    def _delete_lesson(self):
+        if self.job is not None or self.lesson_id is None:
+            return
+        if QMessageBox.question(self, "Удалить лекцию", "Переместить лекцию с её аудио и текстом в корзину?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            library.archive_lesson(self.lesson_id)
+            self.lesson_changed.emit()
+            self.accept()
         except Exception as error:
             self.state.setText(str(error))
 

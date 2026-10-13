@@ -17,13 +17,15 @@ from pathlib import Path
 from typing import Callable
 
 from .audio import ALLOWED_EXTENSIONS
+from . import storage
+import shutil
 
-DEFAULT_MODEL = "small"
+DEFAULT_MODEL = "turbo"
 MAX_FILE_BYTES = 2 * 1024**3
 MAX_DURATION_SECONDS = 4 * 60 * 60
 SAMPLE_RATE = 16000
 CHUNK_SECONDS = 120
-MLX_MODELS = {"tiny": "mlx-community/whisper-tiny", "small": "mlx-community/whisper-small-mlx"}
+MLX_MODELS = {"turbo": "mlx-community/whisper-large-v3-turbo-4bit", "tiny": "mlx-community/whisper-tiny", "small": "mlx-community/whisper-small-mlx"}
 _MODEL_LOCK = threading.Lock()
 _CPU_MODELS = {}
 
@@ -83,19 +85,52 @@ def _decode_audio(path: Path, destination: Path, cancel_event, timeout_seconds: 
                 raise TranscriptionError("Не удалось прочитать аудио. Проверьте, что запись воспроизводится и не повреждена.")
 
 
+def _mlx_model_path(model: str) -> str:
+    if model != "turbo":
+        return MLX_MODELS[model]
+    from huggingface_hub import snapshot_download
+    snapshot = Path(snapshot_download(MLX_MODELS[model], allow_patterns=["config.json", "model.safetensors"]))
+    # The compact model uses model.safetensors; mlx-whisper 0.4 expects
+    # weights.safetensors. Adapt filenames without copying or altering weights.
+    adapter = storage.get_data_dir() / "models" / "whisper-turbo" / snapshot.name
+    adapter.mkdir(parents=True, exist_ok=True)
+    config = adapter / "config.json"
+    if not config.is_file():
+        shutil.copyfile(snapshot / "config.json", config)
+    weights = adapter / "weights.safetensors"
+    if not weights.exists():
+        weights.symlink_to((snapshot / "model.safetensors").resolve())
+    return str(adapter)
+
+
+def _chunk_cut(samples, is_final: bool) -> int:
+    """Prefer a quiet 100 ms interval near the boundary over cutting a word."""
+    import numpy as np
+    if is_final or len(samples) < 10 * SAMPLE_RATE:
+        return len(samples)
+    window = SAMPLE_RATE // 10
+    search = min(len(samples), 3 * SAMPLE_RATE)
+    start = len(samples) - search
+    tail = samples[start: start + search // window * window].reshape(-1, window)
+    energy = np.sqrt(np.mean(tail ** 2, axis=1))
+    best = int(np.argmin(energy))
+    return start + best * window + window // 2 if energy[best] < .003 else len(samples)
+
+
 def _recognize(samples, *, backend, model, language, prompt):
     if backend == "mlx":
         import mlx_whisper
         return mlx_whisper.transcribe(
-            samples, path_or_hf_repo=MLX_MODELS[model], language=language,
+            samples, path_or_hf_repo=_mlx_model_path(model), language=language,
             initial_prompt=prompt, verbose=None, condition_on_previous_text=False,
+            temperature=0.0, no_speech_threshold=0.5, logprob_threshold=-0.8,
         )
     from faster_whisper import WhisperModel
     if model not in _CPU_MODELS:
-        _CPU_MODELS[model] = WhisperModel(model, device="cpu", compute_type="int8")
+        _CPU_MODELS[model] = WhisperModel("large-v3-turbo" if model == "turbo" else model, device="cpu", compute_type="int8")
     segments, info = _CPU_MODELS[model].transcribe(
         samples, language=language, initial_prompt=prompt,
-        vad_filter=True, condition_on_previous_text=False,
+        vad_filter=True, condition_on_previous_text=False, beam_size=5, temperature=0.0,
     )
     parts = [{"start": s.start, "end": s.end, "text": s.text} for s in segments]
     return {"text": " ".join(s["text"].strip() for s in parts), "segments": parts, "language": info.language}
@@ -118,7 +153,7 @@ def transcribe_audio(
     path = Path(audio_path).expanduser().resolve()
     model = model or os.environ.get("KONSPEKT_WHISPER_MODEL", DEFAULT_MODEL)
     if model not in MLX_MODELS:
-        raise TranscriptionError("Доступные модели: tiny, small.")
+        raise TranscriptionError("Доступные модели: turbo, small, tiny.")
     if backend == "auto":
         backend = "mlx" if platform.system() == "Darwin" and platform.machine() == "arm64" else "cpu"
     if backend not in ("mlx", "cpu"):
@@ -152,20 +187,29 @@ def transcribe_audio(
                     all_segments = []
                     texts = []
                     chunk_frames = CHUNK_SECONDS * SAMPLE_RATE
-                    count = (frames + chunk_frames - 1) // chunk_frames
-                    for index in range(count):
+                    position = 0
+                    index = 0
+                    while position < frames:
                         _check_cancel(cancel_event)
+                        audio.setpos(position)
                         samples = np.frombuffer(audio.readframes(chunk_frames), dtype="<i2").astype(np.float32) / 32768.0
-                        report(f"Распознавание фрагмента {index + 1} из {count}…" + (" При первом запуске ожидайте скачивания модели." if index == 0 else ""))
-                        # Exact silence should not produce invented speech.
-                        if not np.any(samples):
+                        cut = _chunk_cut(samples, position + len(samples) >= frames)
+                        samples = samples[:cut]
+                        offset = position / SAMPLE_RATE
+                        position += cut
+                        index += 1
+                        report(f"Распознавание: {round(position * 100 / frames)}%, фрагмент {index}…" + (" При первом запуске ожидайте скачивания модели." if index == 1 else ""))
+                        # Skip genuine silence, including very low-level background noise.
+                        if float(np.sqrt(np.mean(samples ** 2))) < .0001:
                             continue
-                        payload = _recognize(samples, backend=backend, model=model, language=language, prompt=prompt)
+                        context = prompt or ""
+                        if texts:
+                            context = (context + "\n" + texts[-1][-200:]).strip()
+                        payload = _recognize(samples, backend=backend, model=model, language=language, prompt=context or None)
                         _check_cancel(cancel_event)
                         text = payload.get("text", "").strip()
                         if text:
                             texts.append(text)
-                        offset = index * CHUNK_SECONDS
                         for item in payload.get("segments", []):
                             all_segments.append(TranscriptSegment(
                                 offset + float(item["start"]), offset + float(item["end"]), item["text"].strip()))

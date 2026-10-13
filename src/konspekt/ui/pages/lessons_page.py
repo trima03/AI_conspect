@@ -9,6 +9,7 @@ from ..widgets import ScrollPage, LessonRow
 
 class LessonsPage(ScrollPage):
     lesson_requested = Signal(int)
+    delete_requested = Signal(int)
 
     def refresh(self):
         while self.body.count():
@@ -25,6 +26,9 @@ class LessonsPage(ScrollPage):
                 button = QPushButton("Открыть")
                 button.clicked.connect(lambda checked=False, ident=lesson.id: self.lesson_requested.emit(ident))
                 row.layout().addWidget(button)
+                delete = QPushButton("Удалить")
+                delete.clicked.connect(lambda checked=False, ident=lesson.id: self.delete_requested.emit(ident))
+                row.layout().addWidget(delete)
                 self.body.addWidget(row)
             if not lessons:
                 self.body.addWidget(QLabel("Добавьте первую лекцию на главной странице."))

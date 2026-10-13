@@ -110,14 +110,18 @@ def create_lesson_with_audio(
 
     # 4. Запись урока в базу. При любом сбое убираем созданную копию.
     try:
-        return storage.create_lesson(subject_id, title, copy_path)
+        source = Path(source_path).expanduser().resolve()
+        recordings = (storage.get_data_dir() / "recordings").resolve()
+        recording_path = str(source) if source.parent == recordings and not Path(source_path).is_symlink() else None
+        return storage.create_lesson(subject_id, title, copy_path, recording_path=recording_path)
     except BaseException as error:
         _cleanup_after_failed_write(error, copy_path)
         raise
 
 
 def attach_audio_to_lesson(
-    lesson_id: int, source_path: str | os.PathLike[str]
+    lesson_id: int, source_path: str | os.PathLike[str],
+    *, max_size_bytes: int = audio.MAX_SIZE_BYTES,
 ) -> storage.Lesson:
     """Сохраняет копию аудио и записывает путь к ней в урок.
 
@@ -134,10 +138,13 @@ def attach_audio_to_lesson(
     storage.get_lesson(lesson_id)
 
     # 2. Копия аудио (здесь же проверяются формат и размер).
-    copy_path = audio.save_audio(source_path)
+    copy_path = audio.save_audio(source_path, max_size_bytes=max_size_bytes)
 
     # 3. Запись пути в базу. При любом сбое убираем созданную копию.
     try:
+        source = Path(source_path).expanduser().resolve()
+        if source.parent == (storage.get_data_dir() / "recordings").resolve() and not Path(source_path).is_symlink():
+            return storage.set_lesson_audio_path(lesson_id, copy_path, recording_path=str(source))
         return storage.set_lesson_audio_path(lesson_id, copy_path)
     except BaseException as error:
         removed = _remove_copy(copy_path)
