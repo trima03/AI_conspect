@@ -84,10 +84,10 @@ def _format_mb(size_bytes: int) -> str:
     return f"{size_bytes / _BYTES_IN_MB:.1f}".replace(".", ",")
 
 
-def _too_large_error(size_bytes: int) -> AudioTooLargeError:
+def _too_large_error(size_bytes: int, limit: int = MAX_SIZE_BYTES) -> AudioTooLargeError:
     return AudioTooLargeError(
         f"Файл слишком большой: {_format_mb(size_bytes)} МБ. "
-        f"Максимальный размер — {MAX_SIZE_BYTES // _BYTES_IN_MB} МБ."
+        f"Максимальный размер — {limit // _BYTES_IN_MB} МБ."
     )
 
 
@@ -150,7 +150,7 @@ def _copy_error(source: Path, error: OSError) -> AudioError:
 # --- Публичные функции ---------------------------------------------------
 
 
-def validate_audio_file(source_path: str | os.PathLike[str]) -> Path:
+def validate_audio_file(source_path: str | os.PathLike[str], *, max_size_bytes: int = MAX_SIZE_BYTES) -> Path:
     """Проверяет исходный файл и возвращает его путь.
 
     Проверяются: файл указан, существует, это файл, формат разрешён,
@@ -159,7 +159,7 @@ def validate_audio_file(source_path: str | os.PathLike[str]) -> Path:
     if source_path is None or str(source_path).strip() == "":
         raise AudioError("Не указан путь к аудиофайлу.")
     try:
-        source = Path(source_path)
+        source = Path(source_path).expanduser()
     except TypeError:
         raise AudioError("Путь к аудиофайлу указан неверно.") from None
 
@@ -190,20 +190,20 @@ def validate_audio_file(source_path: str | os.PathLike[str]) -> Path:
         ) from error
     if size == 0:
         raise AudioError(f"Файл «{source.name}» пустой (0 байт).")
-    if size > MAX_SIZE_BYTES:
-        raise _too_large_error(size)
+    if size > max_size_bytes:
+        raise _too_large_error(size, max_size_bytes)
 
     return source
 
 
-def save_audio(source_path: str | os.PathLike[str]) -> Path:
+def save_audio(source_path: str | os.PathLike[str], *, max_size_bytes: int = MAX_SIZE_BYTES) -> Path:
     """Копирует аудиофайл в папку data/audio/ и возвращает путь к копии.
 
     Исходный файл не меняется. Если что-то пошло не так, выдаётся AudioError
     (или одна из его разновидностей) с понятным текстом, а недокопированный
     файл удаляется.
     """
-    source = validate_audio_file(source_path)
+    source = validate_audio_file(source_path, max_size_bytes=max_size_bytes)
     extension = source.suffix.lower()  # в имени копии расширение всегда маленькими буквами
 
     audio_dir = storage.get_audio_dir()
@@ -238,9 +238,9 @@ def save_audio(source_path: str | os.PathLike[str]) -> Path:
         raise AudioError(
             f"Не удалось проверить копию файла «{source.name}»: {error}"
         ) from error
-    if copied_size > MAX_SIZE_BYTES:
+    if copied_size > max_size_bytes:
         _remove_quietly(destination)
-        raise _too_large_error(copied_size)
+        raise _too_large_error(copied_size, max_size_bytes)
     if copied_size != source_size:
         _remove_quietly(destination)
         raise AudioError(

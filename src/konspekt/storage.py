@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 import sqlite3
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
@@ -123,7 +123,9 @@ CREATE TABLE IF NOT EXISTS lessons (
     summary       TEXT,
     error_message TEXT,
     created_at    TEXT NOT NULL,
-    updated_at    TEXT NOT NULL
+    updated_at    TEXT NOT NULL,
+    deleted_at    TEXT,
+    recording_path TEXT
 );
 """
 
@@ -171,7 +173,7 @@ def _to_subject(row: sqlite3.Row) -> Subject:
 
 def _to_lesson(row: sqlite3.Row) -> Lesson:
     # Названия колонок в таблице совпадают с полями Lesson.
-    return Lesson(**dict(row))
+    return Lesson(**{field.name: row[field.name] for field in fields(Lesson)})
 
 
 # --- Создание базы -------------------------------------------------------
@@ -183,6 +185,18 @@ def init_db() -> None:
     get_audio_dir().mkdir(parents=True, exist_ok=True)
     with _connect(must_exist=False) as conn:
         conn.executescript(_SCHEMA)
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(lessons)")}
+        for name in ("deleted_at", "recording_path"):
+            if name not in columns:
+                conn.execute(f"ALTER TABLE lessons ADD COLUMN {name} TEXT")
+        conn.execute("""CREATE TABLE IF NOT EXISTS trash (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            title TEXT NOT NULL,
+            lesson_id INTEGER,
+            payload TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )""")
 
 
 # --- Предметы ------------------------------------------------------------
@@ -236,7 +250,7 @@ def get_subject(subject_id: int) -> Subject:
 # --- Уроки ---------------------------------------------------------------
 
 
-def create_lesson(subject_id: int, title: str, audio_path: str | Path) -> Lesson:
+def create_lesson(subject_id: int, title: str, audio_path: str | Path, *, recording_path: str | None = None) -> Lesson:
     """Создаёт урок со статусом queued."""
     cleaned_title = _clean_text(title, "Название урока")
     cleaned_path = _clean_text(str(audio_path), "Путь к аудиофайлу")
@@ -251,11 +265,11 @@ def create_lesson(subject_id: int, title: str, audio_path: str | Path) -> Lesson
         now = _now()
         cursor = conn.execute(
             "INSERT INTO lessons (subject_id, title, audio_path, status, "
-            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (subject_id, cleaned_title, cleaned_path, STATUS_QUEUED, now, now),
+            "created_at, updated_at, recording_path) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (subject_id, cleaned_title, cleaned_path, STATUS_QUEUED, now, now, recording_path),
         )
         row = conn.execute(
-            "SELECT * FROM lessons WHERE id = ?", (cursor.lastrowid,)
+            "SELECT * FROM lessons WHERE id = ? AND deleted_at IS NULL", (cursor.lastrowid,)
         ).fetchone()
     return _to_lesson(row)
 
@@ -264,7 +278,7 @@ def list_lessons(subject_id: int) -> list[Lesson]:
     """Все уроки предмета в порядке создания."""
     with _connect() as conn:
         rows = conn.execute(
-            "SELECT * FROM lessons WHERE subject_id = ? ORDER BY id", (subject_id,)
+            "SELECT * FROM lessons WHERE subject_id = ? AND deleted_at IS NULL ORDER BY id", (subject_id,)
         ).fetchall()
     return [_to_lesson(row) for row in rows]
 
@@ -273,7 +287,7 @@ def get_lesson(lesson_id: int) -> Lesson:
     """Урок по номеру. Если нет такого, выдаёт NotFoundError."""
     with _connect() as conn:
         row = conn.execute(
-            "SELECT * FROM lessons WHERE id = ?", (lesson_id,)
+            "SELECT * FROM lessons WHERE id = ? AND deleted_at IS NULL", (lesson_id,)
         ).fetchone()
     if row is None:
         raise NotFoundError(f"Урок с номером {lesson_id} не найден.")
@@ -298,18 +312,18 @@ def set_lesson_status(
     with _connect() as conn:
         cursor = conn.execute(
             "UPDATE lessons SET status = ?, error_message = ?, updated_at = ? "
-            "WHERE id = ?",
+            "WHERE id = ? AND deleted_at IS NULL",
             (status, error_message, _now(), lesson_id),
         )
         if cursor.rowcount == 0:
             raise NotFoundError(f"Урок с номером {lesson_id} не найден.")
         row = conn.execute(
-            "SELECT * FROM lessons WHERE id = ?", (lesson_id,)
+            "SELECT * FROM lessons WHERE id = ? AND deleted_at IS NULL", (lesson_id,)
         ).fetchone()
     return _to_lesson(row)
 
 
-def set_lesson_audio_path(lesson_id: int, audio_path: str | Path) -> Lesson:
+def set_lesson_audio_path(lesson_id: int, audio_path: str | Path, *, recording_path: str | None = None) -> Lesson:
     """Меняет путь к аудиофайлу урока и возвращает обновлённый урок.
 
     Меняются только audio_path и updated_at. Остальные поля урока
@@ -320,12 +334,58 @@ def set_lesson_audio_path(lesson_id: int, audio_path: str | Path) -> Lesson:
 
     with _connect() as conn:
         cursor = conn.execute(
-            "UPDATE lessons SET audio_path = ?, updated_at = ? WHERE id = ?",
-            (cleaned_path, _now(), lesson_id),
+            "UPDATE lessons SET audio_path = ?, recording_path = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
+            (cleaned_path, recording_path, _now(), lesson_id),
         )
         if cursor.rowcount == 0:
             raise NotFoundError(f"Урок с номером {lesson_id} не найден.")
         row = conn.execute(
-            "SELECT * FROM lessons WHERE id = ?", (lesson_id,)
+            "SELECT * FROM lessons WHERE id = ? AND deleted_at IS NULL", (lesson_id,)
         ).fetchone()
+    return _to_lesson(row)
+
+def claim_lesson_for_transcription(lesson_id: int) -> Lesson:
+    """Atomically claim work, so two workers cannot transcribe the same lesson."""
+    with _connect() as conn:
+        cursor = conn.execute(
+            "UPDATE lessons SET status = ?, error_message = NULL, updated_at = ? "
+            "WHERE id = ? AND deleted_at IS NULL AND status != ?",
+            (STATUS_PROCESSING, _now(), lesson_id, STATUS_PROCESSING),
+        )
+        if cursor.rowcount == 0:
+            if conn.execute("SELECT id FROM lessons WHERE id = ? AND deleted_at IS NULL", (lesson_id,)).fetchone() is None:
+                raise NotFoundError(f"Урок с номером {lesson_id} не найден.")
+            raise StorageError("Этот урок уже обрабатывается.")
+        row = conn.execute("SELECT * FROM lessons WHERE id = ? AND deleted_at IS NULL", (lesson_id,)).fetchone()
+    return _to_lesson(row)
+
+
+def save_lesson_transcript(lesson_id: int, transcript: str) -> Lesson:
+    """Save complete text and completed status in one transaction.
+
+    A summary based on a different transcript becomes stale and is cleared.
+    On failures/cancellation the processing pipeline keeps the old transcript.
+    """
+    text = _clean_text(transcript, "Расшифровка")
+    with _connect() as conn:
+        cursor = conn.execute(
+            "UPDATE lessons SET summary = CASE WHEN transcript = ? THEN summary ELSE NULL END, "
+            "transcript = ?, status = ?, error_message = NULL, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
+            (text, text, STATUS_COMPLETED, _now(), lesson_id),
+        )
+        if cursor.rowcount == 0:
+            raise NotFoundError(f"Урок с номером {lesson_id} не найден.")
+        row = conn.execute("SELECT * FROM lessons WHERE id = ? AND deleted_at IS NULL", (lesson_id,)).fetchone()
+    return _to_lesson(row)
+
+
+def update_lesson_details(lesson_id: int, subject_id: int, title: str) -> Lesson:
+    cleaned = _clean_text(title, "Название лекции")
+    with _connect() as conn:
+        if conn.execute("SELECT id FROM subjects WHERE id = ?", (subject_id,)).fetchone() is None:
+            raise NotFoundError("Предмет не найден.")
+        cursor = conn.execute("UPDATE lessons SET subject_id = ?, title = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL AND status != ?", (subject_id, cleaned, _now(), lesson_id, STATUS_PROCESSING))
+        if not cursor.rowcount:
+            raise StorageError("Лекция не найдена или сейчас обрабатывается.")
+        row = conn.execute("SELECT * FROM lessons WHERE id = ?", (lesson_id,)).fetchone()
     return _to_lesson(row)

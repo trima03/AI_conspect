@@ -18,14 +18,20 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import storage
+from .. import storage, library
+from pathlib import Path
 from .pages.home_page import HomePage
+from .pages.lessons_page import LessonsPage
+from .pages.subjects_page import SubjectsPage
+from .pages.recordings_page import RecordingsPage
+from .pages.trash_page import TrashPage
+from .audio_dialog import AudioDialog
 from .pages.placeholder_page import PlaceholderPage
 
 SIDEBAR_WIDTH = 232
 
 # Названия разделов в боковой панели (порядок совпадает с порядком страниц).
-NAV_TITLES = ("Главная", "Предметы", "Все лекции", "Поиск")
+NAV_TITLES = ("Главная", "Предметы", "Все лекции", "Поиск", "Записи", "Корзина")
 
 
 class MainWindow(QMainWindow):
@@ -44,20 +50,20 @@ class MainWindow(QMainWindow):
 
         # Страницы (позже заглушки заменим настоящими).
         self._home_page = HomePage()
+        self._lessons_page = LessonsPage()
+        self._subjects_page = SubjectsPage()
+        self._recordings_page = RecordingsPage()
+        self._trash_page = TrashPage()
         self._pages = [
             self._home_page,
-            PlaceholderPage(
-                "Предметы",
-                "Здесь будет список предметов и возможность создавать новые.",
-            ),
-            PlaceholderPage(
-                "Все лекции",
-                "Здесь будут все ваши лекции с датой и статусом.",
-            ),
+            self._subjects_page,
+            self._lessons_page,
             PlaceholderPage(
                 "Поиск",
                 "Здесь можно будет искать лекции по названию и тексту.",
             ),
+            self._recordings_page,
+            self._trash_page,
         ]
         self._stack = QStackedWidget()
         for page in self._pages:
@@ -81,6 +87,17 @@ class MainWindow(QMainWindow):
         root.addWidget(content, 1)
 
         self._home_page.add_lesson_requested.connect(self._on_add_lesson_requested)
+        self._home_page.lesson_requested.connect(self._open_lesson)
+        self._lessons_page.lesson_requested.connect(self._open_lesson)
+        self._subjects_page.lesson_requested.connect(self._open_lesson)
+        self._subjects_page.add_requested.connect(lambda subject_id: self._open_lesson(subject_id=subject_id))
+        self._subjects_page.changed.connect(self._refresh_all)
+        self._recordings_page.lesson_requested.connect(self._open_lesson)
+        self._recordings_page.recording_requested.connect(lambda path: self._open_lesson(source_path=path))
+        self._recordings_page.delete_requested.connect(self._delete_recording)
+        self._trash_page.restore_requested.connect(self._restore)
+        for page in (self._home_page, self._lessons_page, self._subjects_page):
+            page.delete_requested.connect(self._delete_lesson)
         self._show_page(0)
 
     # ------------------------------------------------------------------
@@ -129,9 +146,37 @@ class MainWindow(QMainWindow):
         self._nav_buttons[index].setChecked(True)
 
     def _on_add_lesson_requested(self) -> None:
-        # Окно добавления лекции появится на этапе 4.
-        QMessageBox.information(
-            self,
-            "Добавление лекции",
-            "Добавление лекций появится на одном из следующих этапов разработки.",
-        )
+        self._open_lesson()
+
+    def _open_lesson(self, lesson_id=None, subject_id=None, source_path=None) -> None:
+        try:
+            dialog = AudioDialog(lesson_id, self, subject_id=subject_id, source_path=source_path)
+            dialog.lesson_changed.connect(self._refresh_all)
+            dialog.exec()
+            dialog.deleteLater()
+        except Exception as error:
+            QMessageBox.warning(self, "Лекция", str(error))
+        self._show_page(self._stack.currentIndex())
+
+    def _refresh_all(self):
+        for page in self._pages:
+            page.refresh()
+
+    def _delete_lesson(self, lesson_id):
+        lesson = storage.get_lesson(lesson_id)
+        if QMessageBox.question(self, "Удалить лекцию", f"Переместить «{lesson.title}» и её аудио в корзину?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
+            self._library_action(lambda: library.archive_lesson(lesson_id))
+
+    def _delete_recording(self, path):
+        if QMessageBox.question(self, "Удалить запись", "Переместить запись в корзину?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
+            self._library_action(lambda: library.archive_recording(Path(path)))
+
+    def _restore(self, trash_id):
+        self._library_action(lambda: library.restore_item(trash_id))
+
+    def _library_action(self, action):
+        try:
+            action()
+            self._refresh_all()
+        except Exception as error:
+            QMessageBox.warning(self, "Лекция или запись", str(error))

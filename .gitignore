@@ -26,3 +26,10 @@ dist/
 build/
 .idea/
 .vscode/
+
+# Local transcript exports
+transcripts/
+test1.txt
+*.ogg
+*.mp4
+*.webm

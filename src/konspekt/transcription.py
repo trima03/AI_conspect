@@ -1,42 +1,48 @@
-"""Transcribe a local audio file with the OpenAI Audio Transcriptions API.
+"""Local Whisper transcription. Audio never leaves the computer.
 
-The audio file is uploaded to the configured provider when ``transcribe_audio``
-is called. This module never stores the API key or audio contents on disk.
+Model weights are downloaded from Hugging Face on first use, then cached.
+MLX is used on Apple Silicon; the optional CPU backend uses faster-whisper.
 """
-
 from __future__ import annotations
 
-import json
-import mimetypes
 import os
-import ssl
-import uuid
+import platform
+import subprocess
+import tempfile
+import threading
+import time
+import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from typing import Callable
 
-import certifi
+from .audio import ALLOWED_EXTENSIONS
+from . import storage
+import shutil
 
-API_URL = "https://api.openai.com/v1/audio/transcriptions"
-DEFAULT_MODEL = "gpt-transcribe"
-MAX_FILE_BYTES = 25_000_000
-SUPPORTED_EXTENSIONS = {
-    ".flac",
-    ".mp3",
-    ".mp4",
-    ".mpeg",
-    ".mpga",
-    ".m4a",
-    ".ogg",
-    ".wav",
-    ".webm",
-}
+DEFAULT_MODEL = "turbo"
+MAX_FILE_BYTES = 2 * 1024**3
+MAX_DURATION_SECONDS = 4 * 60 * 60
+SAMPLE_RATE = 16000
+CHUNK_SECONDS = 120
+MLX_MODELS = {"turbo": "mlx-community/whisper-large-v3-turbo-4bit", "tiny": "mlx-community/whisper-tiny", "small": "mlx-community/whisper-small-mlx"}
+_MODEL_LOCK = threading.Lock()
+_CPU_MODELS = {}
 
 
 class TranscriptionError(RuntimeError):
-    """An actionable error returned to the application or CLI."""
+    """An actionable error suitable for display."""
+
+
+class TranscriptionCancelled(TranscriptionError):
+    pass
+
+
+@dataclass(frozen=True)
+class TranscriptSegment:
+    start: float
+    end: float
+    text: str
 
 
 @dataclass(frozen=True)
@@ -44,185 +50,181 @@ class TranscriptionResult:
     text: str
     model: str
     languages: tuple[str, ...] = ()
+    segments: tuple[TranscriptSegment, ...] = ()
+
+
+def _check_cancel(cancel_event: threading.Event | None) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise TranscriptionCancelled("Распознавание отменено. Аудиозапись сохранена.")
+
+
+def _decode_audio(path: Path, destination: Path, cancel_event, timeout_seconds: int) -> None:
+    try:
+        import imageio_ffmpeg
+        executable = imageio_ffmpeg.get_ffmpeg_exe()
+    except (ImportError, RuntimeError) as error:
+        raise TranscriptionError("Не найден FFmpeg. Выполните: python -m pip install -e .") from error
+    # Write PCM to disk, rather than keeping an entire lesson in memory.
+    cmd = [executable, "-nostdin", "-v", "error", "-y", "-i", str(path),
+           "-t", str(MAX_DURATION_SECONDS + 1), "-vn", "-ac", "1", "-ar", str(SAMPLE_RATE),
+           "-c:a", "pcm_s16le", str(destination)]
+    with tempfile.TemporaryFile() as errors:
+        with subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=errors) as process:
+            deadline = time.monotonic() + timeout_seconds
+            try:
+                while process.poll() is None:
+                    _check_cancel(cancel_event)
+                    if time.monotonic() > deadline:
+                        raise TranscriptionError("Подготовка аудио заняла слишком много времени.")
+                    time.sleep(0.1)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+            if process.returncode:
+                raise TranscriptionError("Не удалось прочитать аудио. Проверьте, что запись воспроизводится и не повреждена.")
+
+
+def _mlx_model_path(model: str) -> str:
+    if model != "turbo":
+        return MLX_MODELS[model]
+    from huggingface_hub import snapshot_download
+    snapshot = Path(snapshot_download(MLX_MODELS[model], allow_patterns=["config.json", "model.safetensors"]))
+    # The compact model uses model.safetensors; mlx-whisper 0.4 expects
+    # weights.safetensors. Adapt filenames without copying or altering weights.
+    adapter = storage.get_data_dir() / "models" / "whisper-turbo" / snapshot.name
+    adapter.mkdir(parents=True, exist_ok=True)
+    config = adapter / "config.json"
+    if not config.is_file():
+        shutil.copyfile(snapshot / "config.json", config)
+    weights = adapter / "weights.safetensors"
+    if not weights.exists():
+        weights.symlink_to((snapshot / "model.safetensors").resolve())
+    return str(adapter)
+
+
+def _chunk_cut(samples, is_final: bool) -> int:
+    """Prefer a quiet 100 ms interval near the boundary over cutting a word."""
+    import numpy as np
+    if is_final or len(samples) < 10 * SAMPLE_RATE:
+        return len(samples)
+    window = SAMPLE_RATE // 10
+    search = min(len(samples), 3 * SAMPLE_RATE)
+    start = len(samples) - search
+    tail = samples[start: start + search // window * window].reshape(-1, window)
+    energy = np.sqrt(np.mean(tail ** 2, axis=1))
+    best = int(np.argmin(energy))
+    return start + best * window + window // 2 if energy[best] < .003 else len(samples)
+
+
+def _recognize(samples, *, backend, model, language, prompt):
+    if backend == "mlx":
+        import mlx_whisper
+        return mlx_whisper.transcribe(
+            samples, path_or_hf_repo=_mlx_model_path(model), language=language,
+            initial_prompt=prompt, verbose=None, condition_on_previous_text=False,
+            temperature=0.0, no_speech_threshold=0.5, logprob_threshold=-0.8,
+        )
+    from faster_whisper import WhisperModel
+    if model not in _CPU_MODELS:
+        _CPU_MODELS[model] = WhisperModel("large-v3-turbo" if model == "turbo" else model, device="cpu", compute_type="int8")
+    segments, info = _CPU_MODELS[model].transcribe(
+        samples, language=language, initial_prompt=prompt,
+        vad_filter=True, condition_on_previous_text=False, beam_size=5, temperature=0.0,
+    )
+    parts = [{"start": s.start, "end": s.end, "text": s.text} for s in segments]
+    return {"text": " ".join(s["text"].strip() for s in parts), "segments": parts, "language": info.language}
 
 
 def transcribe_audio(
-    audio_path: str | Path,
-    *,
-    language: str = "ru",
-    prompt: str | None = None,
-    model: str | None = None,
-    api_key: str | None = None,
-    timeout_seconds: int = 300,
+    audio_path: str | Path, *, language: str = "ru", prompt: str | None = None,
+    model: str | None = None, backend: str = "auto", timeout_seconds: int = 300,
+    cancel_event: threading.Event | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> TranscriptionResult:
-    """Upload an audio file and return its transcript.
+    """Transcribe in bounded chunks, without an API key or paid service.
 
-    Args:
-        audio_path: Local path to a supported audio file.
-        language: Expected language as an ISO-639-1 code (``ru`` by default).
-        prompt: Optional short context such as course-specific terminology.
-        model: API model ID. Defaults to ``OPENAI_TRANSCRIPTION_MODEL`` or
-            ``gpt-transcribe``.
-        api_key: Optional key override; normally read from ``OPENAI_API_KEY``.
-        timeout_seconds: Maximum time to wait for the provider response.
-
-    Raises:
-        TranscriptionError: If the file, credentials, connection, or API response
-            is invalid.
+    Cancellation is checked during decoding and between model calls. An ongoing
+    download/model call must finish first. timeout_seconds bounds decoding only.
+    Call from a worker thread, never from the GUI thread.
     """
-
-    path = Path(audio_path).expanduser()
-    if not path.exists() or not path.is_file():
+    report = progress or (lambda message: None)
+    _check_cancel(cancel_event)
+    path = Path(audio_path).expanduser().resolve()
+    model = model or os.environ.get("KONSPEKT_WHISPER_MODEL", DEFAULT_MODEL)
+    if model not in MLX_MODELS:
+        raise TranscriptionError("Доступные модели: turbo, small, tiny.")
+    if backend == "auto":
+        backend = "mlx" if platform.system() == "Darwin" and platform.machine() == "arm64" else "cpu"
+    if backend not in ("mlx", "cpu"):
+        raise TranscriptionError("Доступные движки: auto, mlx, cpu.")
+    if not path.is_file():
         raise TranscriptionError(f"Аудиофайл не найден: {path}")
-
-    extension = path.suffix.lower()
-    if extension not in SUPPORTED_EXTENSIONS:
-        allowed = ", ".join(sorted(SUPPORTED_EXTENSIONS))
-        raise TranscriptionError(
-            f"Формат {extension or '(без расширения)'} не поддерживается. "
-            f"Допустимые форматы: {allowed}"
-        )
-
-    file_size = path.stat().st_size
-    if file_size == 0:
-        raise TranscriptionError("Аудиофайл пустой.")
-    if file_size > MAX_FILE_BYTES:
-        raise TranscriptionError(
-            "Файл больше 25 MB. Для MVP сожмите запись или разделите её на части "
-            "до 25 MB; автоматическое разбиение добавим отдельно."
-        )
-
-    resolved_key = api_key or os.environ.get("OPENAI_API_KEY")
-    if not resolved_key:
-        raise TranscriptionError(
-            "Не задан OPENAI_API_KEY. Укажите его в переменных окружения; "
-            "не вставляйте ключ в исходный код."
-        )
-
-    resolved_model = model or os.environ.get(
-        "OPENAI_TRANSCRIPTION_MODEL", DEFAULT_MODEL
-    )
-    boundary = f"----AIConspect{uuid.uuid4().hex}"
-    body = _make_multipart_body(
-        boundary=boundary,
-        path=path,
-        language=language,
-        prompt=prompt,
-        model=resolved_model,
-    )
-    request = Request(
-        API_URL,
-        data=body,
-        headers={
-            "Authorization": f"Bearer {resolved_key}",
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "Accept": "application/json",
-        },
-        method="POST",
-    )
-
+    if path.suffix.lower() not in ALLOWED_EXTENSIONS:
+        raise TranscriptionError("Неподдерживаемый формат аудио: " + path.suffix)
+    if not 0 < path.stat().st_size <= MAX_FILE_BYTES:
+        raise TranscriptionError("Аудиофайл должен быть непустым и не больше 2 ГБ.")
+    if timeout_seconds <= 0:
+        raise TranscriptionError("Время ожидания должно быть положительным.")
     try:
-        # Some macOS Python builds do not automatically use the system keychain.
-        # certifi provides a maintained CA bundle while keeping TLS verification on.
-        tls_context = ssl.create_default_context(cafile=certifi.where())
-        with urlopen(
-            request, timeout=timeout_seconds, context=tls_context
-        ) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except HTTPError as error:
-        details = error.read().decode("utf-8", errors="replace")
-        message = _api_error_message(details) or f"HTTP {error.code}"
-        if error.code == 401:
-            message = "Провайдер не принял API-ключ. Проверьте OPENAI_API_KEY."
-        elif error.code == 429:
-            message = "Превышен лимит запросов или средств API. Попробуйте позже."
-        elif error.code in (413, 400) and file_size > MAX_FILE_BYTES:
-            message = "Файл превышает допустимый размер запроса."
-        raise TranscriptionError(f"Ошибка сервиса распознавания: {message}") from error
-    except URLError as error:
-        raise TranscriptionError(
-            f"Не удалось подключиться к сервису распознавания: {error.reason}"
-        ) from error
-    except TimeoutError as error:
-        raise TranscriptionError(
-            "Сервис не ответил вовремя. Повторите обработку."
-        ) from error
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise TranscriptionError(
-            "Сервис вернул ответ в неизвестном формате."
-        ) from error
-
-    text = payload.get("text") if isinstance(payload, dict) else None
-    if not isinstance(text, str) or not text.strip():
-        raise TranscriptionError("В ответе сервиса не найден распознанный текст.")
-
-    languages = payload.get("languages", [])
-    language_codes = tuple(
-        item["code"]
-        for item in languages
-        if isinstance(item, dict) and isinstance(item.get("code"), str)
-    ) if isinstance(languages, list) else ()
-
-    return TranscriptionResult(
-        text=text.strip(),
-        model=resolved_model,
-        languages=language_codes,
-    )
-
-
-def _make_multipart_body(
-    *,
-    boundary: str,
-    path: Path,
-    language: str,
-    prompt: str | None,
-    model: str,
-) -> bytes:
-    """Build a multipart request body for files capped at 25 MB."""
-
-    marker = boundary.encode("ascii")
-    pieces: list[bytes] = []
-
-    def add_field(name: str, value: str) -> None:
-        pieces.extend(
-            [
-                b"--" + marker + b"\r\n",
-                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode(),
-                value.encode("utf-8"),
-                b"\r\n",
-            ]
-        )
-
-    add_field("model", model)
-    add_field("response_format", "json")
-    add_field("languages[]", language)
-    if prompt:
-        add_field("prompt", prompt)
-
-    mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-    safe_filename = path.name.replace('"', "_").replace("\r", "_").replace("\n", "_")
-    pieces.extend(
-        [
-            b"--" + marker + b"\r\n",
-            (
-                f'Content-Disposition: form-data; name="file"; '
-                f'filename="{safe_filename}"\r\n'
-                f"Content-Type: {mime_type}\r\n\r\n"
-            ).encode("utf-8"),
-            path.read_bytes(),
-            b"\r\n--" + marker + b"--\r\n",
-        ]
-    )
-    return b"".join(pieces)
-
-
-def _api_error_message(response_body: str) -> str | None:
-    try:
-        payload: Any = json.loads(response_body)
-    except json.JSONDecodeError:
-        return None
-    if isinstance(payload, dict):
-        error = payload.get("error")
-        if isinstance(error, dict) and isinstance(error.get("message"), str):
-            return error["message"]
-    return None
+        import numpy as np
+        report("Подготовка аудиозаписи…")
+        with tempfile.TemporaryDirectory(prefix="konspekt-audio-") as temp:
+            decoded = Path(temp) / "audio.wav"
+            _decode_audio(path, decoded, cancel_event, timeout_seconds)
+            with wave.open(str(decoded), "rb") as audio:
+                frames = audio.getnframes()
+                if not frames:
+                    raise TranscriptionError("В файле нет аудиоданных.")
+                if frames / SAMPLE_RATE > MAX_DURATION_SECONDS:
+                    raise TranscriptionError("Максимальная длительность записи — 4 часа.")
+                _check_cancel(cancel_event)
+                report("Загрузка модели. При первом запуске нужны интернет и время для скачивания…")
+                # MLX caches a single model globally; serialize calls across threads.
+                while not _MODEL_LOCK.acquire(timeout=0.2):
+                    _check_cancel(cancel_event)
+                try:
+                    all_segments = []
+                    texts = []
+                    chunk_frames = CHUNK_SECONDS * SAMPLE_RATE
+                    position = 0
+                    index = 0
+                    while position < frames:
+                        _check_cancel(cancel_event)
+                        audio.setpos(position)
+                        samples = np.frombuffer(audio.readframes(chunk_frames), dtype="<i2").astype(np.float32) / 32768.0
+                        cut = _chunk_cut(samples, position + len(samples) >= frames)
+                        samples = samples[:cut]
+                        offset = position / SAMPLE_RATE
+                        position += cut
+                        index += 1
+                        report(f"Распознавание: {round(position * 100 / frames)}%, фрагмент {index}…" + (" При первом запуске ожидайте скачивания модели." if index == 1 else ""))
+                        # Skip genuine silence, including very low-level background noise.
+                        if float(np.sqrt(np.mean(samples ** 2))) < .0001:
+                            continue
+                        context = prompt or ""
+                        if texts:
+                            context = (context + "\n" + texts[-1][-200:]).strip()
+                        payload = _recognize(samples, backend=backend, model=model, language=language, prompt=context or None)
+                        _check_cancel(cancel_event)
+                        text = payload.get("text", "").strip()
+                        if text:
+                            texts.append(text)
+                        for item in payload.get("segments", []):
+                            all_segments.append(TranscriptSegment(
+                                offset + float(item["start"]), offset + float(item["end"]), item["text"].strip()))
+                finally:
+                    _MODEL_LOCK.release()
+        if not texts:
+            raise TranscriptionError("Речь не обнаружена. Проверьте громкость записи и выбранный микрофон.")
+        report("Расшифровка готова.")
+        return TranscriptionResult("\n\n".join(texts), model, (language,), tuple(all_segments))
+    except TranscriptionError:
+        raise
+    except ImportError as error:
+        if "metal" in str(error).lower():
+            raise TranscriptionError("MLX не получил доступ к графике Mac. Запустите приложение из PyCharm или Terminal; для CPU установите .[cpu] и выберите --backend cpu.") from error
+        extra = "mac" if backend == "mlx" else "cpu"
+        raise TranscriptionError(f'Не установлены зависимости распознавания. Выполните: python -m pip install -e ".[desktop,{extra}]"') from error
+    except Exception as error:
+        raise TranscriptionError(f"Не удалось распознать запись локально: {error}") from error

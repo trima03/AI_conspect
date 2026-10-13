@@ -1,34 +1,49 @@
-"""Command-line entry point for audio transcription."""
-
+"""Local transcription CLI: transcribe-lesson recording.m4a --model small."""
 from __future__ import annotations
 
 import argparse
 import sys
+import sqlite3
+from pathlib import Path
 
-from .transcription import TranscriptionError, transcribe_audio
+from . import storage
+from .transcription import TranscriptionError, DEFAULT_MODEL, transcribe_audio
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Распознать речь из аудиофайла и вывести текст в терминал."
-    )
-    parser.add_argument("audio", help="Путь к аудиофайлу")
-    parser.add_argument("--language", default="ru", help="Язык записи (по умолчанию: ru)")
-    parser.add_argument("--prompt", help="Термины или контекст урока для подсказки модели")
-    args = parser.parse_args()
-
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="Бесплатно распознать аудио на компьютере.")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("audio", nargs="?", help="Путь к аудиофайлу")
+    source.add_argument("--lesson-id", type=int, help="Распознать и сохранить существующий урок")
+    parser.add_argument("--language", default="ru")
+    parser.add_argument("--prompt", help="Термины и контекст урока")
+    parser.add_argument("--model", choices=("turbo", "tiny", "small"), default=DEFAULT_MODEL)
+    parser.add_argument("--backend", choices=("auto", "mlx", "cpu"), default="auto")
+    parser.add_argument("--output", type=Path, help="Сохранить текст в новый файл UTF-8")
+    args = parser.parse_args(argv)
+    if args.output and args.output.exists():
+        parser.error("Выходной файл уже существует. Укажите новое имя, чтобы сохранить прежний текст.")
     try:
-        result = transcribe_audio(
-            args.audio,
-            language=args.language,
-            prompt=args.prompt,
-        )
-    except TranscriptionError as error:
+        options = dict(language=args.language, prompt=args.prompt, model=args.model, backend=args.backend,
+                       progress=lambda message: print(message, file=sys.stderr))
+        if args.lesson_id is not None:
+            from .pipeline import transcribe_lesson
+            text = transcribe_lesson(args.lesson_id, **options).transcript
+        else:
+            text = transcribe_audio(args.audio, **options).text
+        if args.output:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            with args.output.open("x", encoding="utf-8") as output:
+                output.write(text + "\n")
+            print(f"Текст сохранён: {args.output}", file=sys.stderr)
+        print(text)
+        return 0
+    except KeyboardInterrupt:
+        print("Обработка прервана.", file=sys.stderr)
+        return 130
+    except (TranscriptionError, storage.StorageError, OSError, sqlite3.Error) as error:
         print(f"Ошибка: {error}", file=sys.stderr)
         return 1
-
-    print(result.text)
-    return 0
 
 
 if __name__ == "__main__":
