@@ -329,3 +329,37 @@ def set_lesson_audio_path(lesson_id: int, audio_path: str | Path) -> Lesson:
             "SELECT * FROM lessons WHERE id = ?", (lesson_id,)
         ).fetchone()
     return _to_lesson(row)
+
+def claim_lesson_for_transcription(lesson_id: int) -> Lesson:
+    """Atomically claim work, so two workers cannot transcribe the same lesson."""
+    with _connect() as conn:
+        cursor = conn.execute(
+            "UPDATE lessons SET status = ?, error_message = NULL, updated_at = ? "
+            "WHERE id = ? AND status != ?",
+            (STATUS_PROCESSING, _now(), lesson_id, STATUS_PROCESSING),
+        )
+        if cursor.rowcount == 0:
+            if conn.execute("SELECT id FROM lessons WHERE id = ?", (lesson_id,)).fetchone() is None:
+                raise NotFoundError(f"Урок с номером {lesson_id} не найден.")
+            raise StorageError("Этот урок уже обрабатывается.")
+        row = conn.execute("SELECT * FROM lessons WHERE id = ?", (lesson_id,)).fetchone()
+    return _to_lesson(row)
+
+
+def save_lesson_transcript(lesson_id: int, transcript: str) -> Lesson:
+    """Save complete text and completed status in one transaction.
+
+    A summary based on a different transcript becomes stale and is cleared.
+    On failures/cancellation the processing pipeline keeps the old transcript.
+    """
+    text = _clean_text(transcript, "Расшифровка")
+    with _connect() as conn:
+        cursor = conn.execute(
+            "UPDATE lessons SET summary = CASE WHEN transcript = ? THEN summary ELSE NULL END, "
+            "transcript = ?, status = ?, error_message = NULL, updated_at = ? WHERE id = ?",
+            (text, text, STATUS_COMPLETED, _now(), lesson_id),
+        )
+        if cursor.rowcount == 0:
+            raise NotFoundError(f"Урок с номером {lesson_id} не найден.")
+        row = conn.execute("SELECT * FROM lessons WHERE id = ?", (lesson_id,)).fetchone()
+    return _to_lesson(row)

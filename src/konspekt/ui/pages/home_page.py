@@ -22,6 +22,7 @@ class HomePage(ScrollPage):
 
     # Страница не знает, как добавлять лекции: она только сообщает об этом окну.
     add_lesson_requested = Signal()
+    lesson_requested = Signal(int)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -73,8 +74,7 @@ class HomePage(ScrollPage):
         recent_layout.addLayout(self._rows_layout)
 
         self._hint_label = QLabel(
-            "Расшифровка в этой версии пока не запускается: "
-            "новые лекции остаются в очереди."
+            "Откройте лекцию, чтобы прочитать текст или запустить распознавание."
         )
         self._hint_label.setObjectName("HintText")
         self._hint_label.setWordWrap(True)
@@ -151,9 +151,11 @@ class HomePage(ScrollPage):
 
         for item in overview.recent:
             meta = f"{item.subject_name} · {format_datetime(item.created_at)}"
-            self._rows_layout.addWidget(
-                LessonRow(item.title, meta, item.status, item.error_message)
-            )
+            row = LessonRow(item.title, meta, item.status, item.error_message)
+            button = QPushButton("Открыть")
+            button.clicked.connect(lambda checked=False, ident=item.id: self.lesson_requested.emit(ident))
+            row.layout().addWidget(button)
+            self._rows_layout.addWidget(row)
         self._hint_label.show()
 
     def _show_load_error(self) -> None:

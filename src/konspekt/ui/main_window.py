@@ -20,6 +20,8 @@ from PySide6.QtWidgets import (
 
 from .. import storage
 from .pages.home_page import HomePage
+from .pages.lessons_page import LessonsPage
+from .audio_dialog import AudioDialog
 from .pages.placeholder_page import PlaceholderPage
 
 SIDEBAR_WIDTH = 232
@@ -44,16 +46,14 @@ class MainWindow(QMainWindow):
 
         # Страницы (позже заглушки заменим настоящими).
         self._home_page = HomePage()
+        self._lessons_page = LessonsPage()
         self._pages = [
             self._home_page,
             PlaceholderPage(
                 "Предметы",
                 "Здесь будет список предметов и возможность создавать новые.",
             ),
-            PlaceholderPage(
-                "Все лекции",
-                "Здесь будут все ваши лекции с датой и статусом.",
-            ),
+            self._lessons_page,
             PlaceholderPage(
                 "Поиск",
                 "Здесь можно будет искать лекции по названию и тексту.",
@@ -81,6 +81,8 @@ class MainWindow(QMainWindow):
         root.addWidget(content, 1)
 
         self._home_page.add_lesson_requested.connect(self._on_add_lesson_requested)
+        self._home_page.lesson_requested.connect(self._open_lesson)
+        self._lessons_page.lesson_requested.connect(self._open_lesson)
         self._show_page(0)
 
     # ------------------------------------------------------------------
@@ -129,9 +131,15 @@ class MainWindow(QMainWindow):
         self._nav_buttons[index].setChecked(True)
 
     def _on_add_lesson_requested(self) -> None:
-        # Окно добавления лекции появится на этапе 4.
-        QMessageBox.information(
-            self,
-            "Добавление лекции",
-            "Добавление лекций появится на одном из следующих этапов разработки.",
-        )
+        self._open_lesson()
+
+    def _open_lesson(self, lesson_id=None) -> None:
+        try:
+            dialog = AudioDialog(lesson_id, self)
+            dialog.lesson_changed.connect(self._home_page.refresh)
+            dialog.lesson_changed.connect(self._lessons_page.refresh)
+            dialog.exec()
+            dialog.deleteLater()
+        except Exception as error:
+            QMessageBox.warning(self, "Лекция", str(error))
+        self._show_page(self._stack.currentIndex())

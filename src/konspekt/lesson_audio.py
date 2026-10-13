@@ -76,7 +76,8 @@ def _cleanup_after_failed_write(error: BaseException, copy_path: Path) -> None:
 
 
 def create_lesson_with_audio(
-    subject_id: int, title: str, source_path: str | os.PathLike[str]
+    subject_id: int, title: str, source_path: str | os.PathLike[str],
+    *, max_size_bytes: int = audio.MAX_SIZE_BYTES,
 ) -> storage.Lesson:
     """Создаёт урок с аудио одной операцией и возвращает созданный урок.
 
@@ -105,7 +106,7 @@ def create_lesson_with_audio(
         raise ValueError("Название урока не может быть пустым.")
 
     # 3. Копия аудио (здесь же проверяются существование, формат и размер).
-    copy_path = audio.save_audio(source_path)
+    copy_path = audio.save_audio(source_path, max_size_bytes=max_size_bytes)
 
     # 4. Запись урока в базу. При любом сбое убираем созданную копию.
     try:
