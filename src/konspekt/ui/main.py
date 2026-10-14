@@ -11,12 +11,12 @@ import sys
 from logging.handlers import RotatingFileHandler
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QColor, QFont, QPalette
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from .. import storage
 from .main_window import MainWindow
-from .styles import build_stylesheet
+from .styles import COLORS, build_stylesheet
 
 logger = logging.getLogger("konspekt")
 
@@ -76,12 +76,63 @@ def _install_exception_hook() -> None:
     sys.excepthook = hook
 
 
-def _force_light_scheme(app: QApplication) -> None:
-    """Светлая тема независимо от настроек Windows (нужна Qt 6.8 или новее)."""
+def _dark_palette() -> QPalette:
+    """Палитра Dark Pro для стандартных виджетов (диалоги, меню, подсказки).
+
+    Виджеты со своими правилами в styles.py красятся по ним, а всё остальное
+    (например, окна сообщений) берёт цвета отсюда, чтобы не остаться светлым.
+    """
+    colors = {name: QColor(value) for name, value in COLORS.items()}
+    palette = QPalette()
+
+    roles = {
+        QPalette.ColorRole.Window: "BACKGROUND",
+        QPalette.ColorRole.WindowText: "TEXT",
+        QPalette.ColorRole.Base: "INPUT_BG",
+        QPalette.ColorRole.AlternateBase: "CARD",
+        QPalette.ColorRole.Text: "TEXT",
+        QPalette.ColorRole.Button: "BUTTON",
+        QPalette.ColorRole.ButtonText: "TEXT",
+        QPalette.ColorRole.ToolTipBase: "BUTTON",
+        QPalette.ColorRole.ToolTipText: "TEXT",
+        QPalette.ColorRole.PlaceholderText: "MUTED",
+        QPalette.ColorRole.Highlight: "ACCENT",
+        QPalette.ColorRole.Link: "ACCENT_TEXT",
+        QPalette.ColorRole.LinkVisited: "ACCENT_TEXT",
+    }
+    for role, name in roles.items():
+        palette.setColor(role, colors[name])
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#FFFFFF"))
+    palette.setColor(QPalette.ColorRole.BrightText, QColor("#FFFFFF"))
+
+    # Оттенки для рамок и объёма, которые Fusion берёт из палитры.
+    button = colors["BUTTON"]
+    palette.setColor(QPalette.ColorRole.Light, button.lighter(150))
+    palette.setColor(QPalette.ColorRole.Midlight, button.lighter(125))
+    palette.setColor(QPalette.ColorRole.Mid, button.darker(150))
+    palette.setColor(QPalette.ColorRole.Dark, button.darker(200))
+    palette.setColor(QPalette.ColorRole.Shadow, QColor("#000000"))
+
+    # Недоступные элементы: приглушённый текст.
+    for role in (
+        QPalette.ColorRole.WindowText,
+        QPalette.ColorRole.Text,
+        QPalette.ColorRole.ButtonText,
+    ):
+        palette.setColor(QPalette.ColorGroup.Disabled, role, colors["DISABLED_TEXT"])
+    return palette
+
+
+def _apply_dark_scheme(app: QApplication) -> None:
+    """Тёмная тема: схема Qt (нужна Qt 6.8 или новее) и палитра Dark Pro."""
     try:
-        app.styleHints().setColorScheme(Qt.ColorScheme.Light)
+        app.styleHints().setColorScheme(Qt.ColorScheme.Dark)
     except AttributeError:
-        logger.warning("Эта версия Qt не умеет принудительно включать светлую тему")
+        logger.warning(
+            "Эта версия Qt не умеет принудительно включать тёмную схему, "
+            "используется только палитра приложения"
+        )
+    app.setPalette(_dark_palette())
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -89,7 +140,7 @@ def main(argv: list[str] | None = None) -> int:
     app = QApplication(argv if argv is not None else sys.argv)
     app.setApplicationName("AIKonspekt")
     app.setStyle("Fusion")  # единая основа для наших стилей
-    _force_light_scheme(app)
+    _apply_dark_scheme(app)
     app.setFont(QFont("Segoe UI", 10))
     app.setStyleSheet(build_stylesheet())
 
