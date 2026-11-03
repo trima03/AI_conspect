@@ -13,10 +13,12 @@ dependencies = ["numpy>=1.26", "imageio-ffmpeg>=0.6,<1", "sounddevice>=0.5,<1"]
 desktop = ["PySide6>=6.8,<7"]
 mac = ["mlx-whisper>=0.4.3,<0.5; sys_platform == 'darwin' and platform_machine == 'arm64'"]
 cpu = ["faster-whisper>=1.1,<2"]
+notes-mac = ["mlx-lm>=0.30,<0.31; sys_platform == 'darwin' and platform_machine == 'arm64'"]
 
 [project.scripts]
 transcribe-lesson = "konspekt.transcribe:main"
 record-lesson = "konspekt.record:main"
+summarize-lesson = "konspekt.summarize:main"
 aikonspekt = "konspekt.ui.main:main"
 
 [tool.setuptools]

@@ -102,6 +102,8 @@ class LessonRow(QFrame):
         status: str,
         error_message: str | None = None,
         parent: QWidget | None = None,
+        *,
+        preview: str = "",
     ) -> None:
         super().__init__(parent)
         self.setObjectName("LessonRow")
@@ -124,6 +126,13 @@ class LessonRow(QFrame):
         meta_label.setObjectName("Muted")
         meta_label.setTextFormat(Qt.TextFormat.PlainText)
         texts.addWidget(meta_label)
+
+        if preview:
+            preview_label = QLabel(preview)
+            preview_label.setObjectName("SearchExcerpt")
+            preview_label.setTextFormat(Qt.TextFormat.PlainText)
+            preview_label.setWordWrap(True)
+            texts.addWidget(preview_label)
 
         if status == storage.STATUS_FAILED and error_message:
             error_label = QLabel(shorten(error_message))

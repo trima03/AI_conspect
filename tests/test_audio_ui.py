@@ -79,6 +79,16 @@ class AudioUITests(unittest.TestCase):
         self.assertEqual(window._stack.currentIndex(), 2)
         window.close()
 
+    def test_classroom_noise_setting_is_forwarded_and_locked_during_processing(self):
+        self.assertFalse(self.dialog.reduce_noise.isChecked())
+        self.dialog.reduce_noise.setChecked(True)
+        with patch.object(pipeline, 'transcribe_audio', return_value=TranscriptionResult('Текст', 'turbo')) as engine:
+            self.dialog._transcribe()
+            self.assertFalse(self.dialog.reduce_noise.isEnabled())
+            self.wait_done()
+        self.assertTrue(engine.call_args.kwargs['reduce_noise'])
+        self.assertTrue(self.dialog.reduce_noise.isEnabled())
+
     def test_record_then_transcribe(self):
         def fake_record(stop, **kwargs):
             kwargs['progress'](2.0, .5)

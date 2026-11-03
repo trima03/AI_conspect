@@ -125,7 +125,7 @@ QScrollArea#PageScroll {
     font-size: 13pt;
     font-weight: 600;
 }
-#Muted {
+#Muted, #SearchExcerpt {
     color: @MUTED@;
 }
 #HintText {
@@ -265,6 +265,23 @@ QProgressBar {
 QProgressBar::chunk {
     background-color: @ACCENT@;
     border-radius: 6px;
+}
+
+/* ---------- Вкладки расшифровки и конспекта ---------- */
+QTabWidget::pane {
+    border: 1px solid @BORDER@;
+    background-color: @BACKGROUND@;
+}
+QTabBar::tab {
+    background-color: @SURFACE@;
+    color: @MUTED@;
+    padding: 8px 16px;
+    border: 1px solid @BORDER@;
+}
+QTabBar::tab:selected {
+    color: @TEXT@;
+    background-color: @CARD@;
+    border-bottom: 2px solid @ACCENT@;
 }
 
 /* ---------- Меню ---------- */

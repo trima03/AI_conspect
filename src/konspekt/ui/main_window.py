@@ -26,7 +26,6 @@ from .pages.subjects_page import SubjectsPage
 from .pages.recordings_page import RecordingsPage
 from .pages.trash_page import TrashPage
 from .audio_dialog import AudioDialog
-from .pages.placeholder_page import PlaceholderPage
 
 SIDEBAR_WIDTH = 232
 
@@ -51,6 +50,7 @@ class MainWindow(QMainWindow):
         # Страницы (позже заглушки заменим настоящими).
         self._home_page = HomePage()
         self._lessons_page = LessonsPage()
+        self._search_page = LessonsPage(title="Поиск")
         self._subjects_page = SubjectsPage()
         self._recordings_page = RecordingsPage()
         self._trash_page = TrashPage()
@@ -58,10 +58,7 @@ class MainWindow(QMainWindow):
             self._home_page,
             self._subjects_page,
             self._lessons_page,
-            PlaceholderPage(
-                "Поиск",
-                "Здесь можно будет искать лекции по названию и тексту.",
-            ),
+            self._search_page,
             self._recordings_page,
             self._trash_page,
         ]
@@ -89,6 +86,7 @@ class MainWindow(QMainWindow):
         self._home_page.add_lesson_requested.connect(self._on_add_lesson_requested)
         self._home_page.lesson_requested.connect(self._open_lesson)
         self._lessons_page.lesson_requested.connect(self._open_lesson)
+        self._search_page.lesson_requested.connect(self._open_lesson)
         self._subjects_page.lesson_requested.connect(self._open_lesson)
         self._subjects_page.add_requested.connect(lambda subject_id: self._open_lesson(subject_id=subject_id))
         self._subjects_page.changed.connect(self._refresh_all)
@@ -96,7 +94,7 @@ class MainWindow(QMainWindow):
         self._recordings_page.recording_requested.connect(lambda path: self._open_lesson(source_path=path))
         self._recordings_page.delete_requested.connect(self._delete_recording)
         self._trash_page.restore_requested.connect(self._restore)
-        for page in (self._home_page, self._lessons_page, self._subjects_page):
+        for page in (self._home_page, self._lessons_page, self._search_page, self._subjects_page):
             page.delete_requested.connect(self._delete_lesson)
         self._show_page(0)
 

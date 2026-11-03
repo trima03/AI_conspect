@@ -25,8 +25,10 @@ MAX_FILE_BYTES = 2 * 1024**3
 MAX_DURATION_SECONDS = 4 * 60 * 60
 SAMPLE_RATE = 16000
 CHUNK_SECONDS = 120
+# Mild reduction of steady noise; overlapping voices still need a closer microphone.
+CLASSROOM_FILTER = "highpass=f=80,lowpass=f=7600,afftdn=nr=10:nf=-45:tn=1"
 MLX_MODELS = {"turbo": "mlx-community/whisper-large-v3-turbo-4bit", "tiny": "mlx-community/whisper-tiny", "small": "mlx-community/whisper-small-mlx"}
-_MODEL_LOCK = threading.Lock()
+from .compute import MODEL_LOCK as _MODEL_LOCK
 _CPU_MODELS = {}
 
 
@@ -58,7 +60,8 @@ def _check_cancel(cancel_event: threading.Event | None) -> None:
         raise TranscriptionCancelled("Распознавание отменено. Аудиозапись сохранена.")
 
 
-def _decode_audio(path: Path, destination: Path, cancel_event, timeout_seconds: int) -> None:
+def _decode_audio(path: Path, destination: Path, cancel_event, timeout_seconds: int,
+                  *, reduce_noise: bool = False) -> None:
     try:
         import imageio_ffmpeg
         executable = imageio_ffmpeg.get_ffmpeg_exe()
@@ -66,8 +69,10 @@ def _decode_audio(path: Path, destination: Path, cancel_event, timeout_seconds: 
         raise TranscriptionError("Не найден FFmpeg. Выполните: python -m pip install -e .") from error
     # Write PCM to disk, rather than keeping an entire lesson in memory.
     cmd = [executable, "-nostdin", "-v", "error", "-y", "-i", str(path),
-           "-t", str(MAX_DURATION_SECONDS + 1), "-vn", "-ac", "1", "-ar", str(SAMPLE_RATE),
-           "-c:a", "pcm_s16le", str(destination)]
+           "-t", str(MAX_DURATION_SECONDS + 1), "-vn", "-ac", "1", "-ar", str(SAMPLE_RATE)]
+    if reduce_noise:
+        cmd.extend(["-af", CLASSROOM_FILTER])
+    cmd.extend(["-c:a", "pcm_s16le", str(destination)])
     with tempfile.TemporaryFile() as errors:
         with subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=errors) as process:
             deadline = time.monotonic() + timeout_seconds
@@ -141,6 +146,7 @@ def transcribe_audio(
     model: str | None = None, backend: str = "auto", timeout_seconds: int = 300,
     cancel_event: threading.Event | None = None,
     progress: Callable[[str], None] | None = None,
+    reduce_noise: bool = False,
 ) -> TranscriptionResult:
     """Transcribe in bounded chunks, without an API key or paid service.
 
@@ -166,12 +172,14 @@ def transcribe_audio(
         raise TranscriptionError("Аудиофайл должен быть непустым и не больше 2 ГБ.")
     if timeout_seconds <= 0:
         raise TranscriptionError("Время ожидания должно быть положительным.")
+    if not isinstance(reduce_noise, bool):
+        raise TranscriptionError("Режим снижения шума должен быть включён или выключен.")
     try:
         import numpy as np
-        report("Подготовка аудиозаписи…")
+        report("Снижение фонового шума во временной копии записи…" if reduce_noise else "Подготовка аудиозаписи…")
         with tempfile.TemporaryDirectory(prefix="konspekt-audio-") as temp:
             decoded = Path(temp) / "audio.wav"
-            _decode_audio(path, decoded, cancel_event, timeout_seconds)
+            _decode_audio(path, decoded, cancel_event, timeout_seconds, reduce_noise=reduce_noise)
             with wave.open(str(decoded), "rb") as audio:
                 frames = audio.getnframes()
                 if not frames:

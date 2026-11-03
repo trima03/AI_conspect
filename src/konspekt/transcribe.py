@@ -19,13 +19,14 @@ def main(argv=None) -> int:
     parser.add_argument("--prompt", help="Термины и контекст урока")
     parser.add_argument("--model", choices=("turbo", "tiny", "small"), default=DEFAULT_MODEL)
     parser.add_argument("--backend", choices=("auto", "mlx", "cpu"), default="auto")
+    parser.add_argument("--reduce-noise", action="store_true", help="Снизить постоянный фон и гул перед распознаванием; исходный файл не меняется")
     parser.add_argument("--output", type=Path, help="Сохранить текст в новый файл UTF-8")
     args = parser.parse_args(argv)
     if args.output and args.output.exists():
         parser.error("Выходной файл уже существует. Укажите новое имя, чтобы сохранить прежний текст.")
     try:
         options = dict(language=args.language, prompt=args.prompt, model=args.model, backend=args.backend,
-                       progress=lambda message: print(message, file=sys.stderr))
+                       progress=lambda message: print(message, file=sys.stderr), reduce_noise=args.reduce_noise)
         if args.lesson_id is not None:
             from .pipeline import transcribe_lesson
             text = transcribe_lesson(args.lesson_id, **options).transcript

@@ -37,6 +37,7 @@ KNOWN_STATES = {
     "vertical", "horizontal",
 }
 KNOWN_SUBCONTROLS = {
+    "pane", "tab",
     "handle", "add-line", "sub-line", "add-page", "sub-page", "chunk",
     "item", "separator",
 }

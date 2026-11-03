@@ -11,6 +11,8 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import uuid
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass, fields
@@ -189,6 +191,15 @@ def init_db() -> None:
         for name in ("deleted_at", "recording_path"):
             if name not in columns:
                 conn.execute(f"ALTER TABLE lessons ADD COLUMN {name} TEXT")
+        conn.execute("""CREATE TABLE IF NOT EXISTS notes_state (
+            lesson_id INTEGER PRIMARY KEY REFERENCES lessons(id) ON DELETE CASCADE,
+            status TEXT NOT NULL,
+            source_hash TEXT NOT NULL DEFAULT '',
+            model TEXT,
+            job_id TEXT,
+            error_message TEXT,
+            updated_at TEXT NOT NULL
+        )""")
         conn.execute("""CREATE TABLE IF NOT EXISTS trash (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             kind TEXT NOT NULL,
@@ -317,6 +328,8 @@ def set_lesson_status(
         )
         if cursor.rowcount == 0:
             raise NotFoundError(f"Урок с номером {lesson_id} не найден.")
+        if status != STATUS_PROCESSING:
+            conn.execute("UPDATE notes_state SET status = 'cancelled', job_id = NULL, error_message = 'Обработка сброшена.', updated_at = ? WHERE lesson_id = ? AND status = 'processing'", (_now(), lesson_id))
         row = conn.execute(
             "SELECT * FROM lessons WHERE id = ? AND deleted_at IS NULL", (lesson_id,)
         ).fetchone()
@@ -370,11 +383,13 @@ def save_lesson_transcript(lesson_id: int, transcript: str) -> Lesson:
     with _connect() as conn:
         cursor = conn.execute(
             "UPDATE lessons SET summary = CASE WHEN transcript = ? THEN summary ELSE NULL END, "
-            "transcript = ?, status = ?, error_message = NULL, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
-            (text, text, STATUS_COMPLETED, _now(), lesson_id),
+            "transcript = ?, status = CASE WHEN transcript = ? AND status = ? THEN status ELSE ? END, "
+            "error_message = NULL, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
+            (text, text, text, STATUS_PROCESSING, STATUS_COMPLETED, _now(), lesson_id),
         )
         if cursor.rowcount == 0:
             raise NotFoundError(f"Урок с номером {lesson_id} не найден.")
+        conn.execute("UPDATE notes_state SET status = 'stale', model = NULL, job_id = NULL, error_message = NULL, updated_at = ? WHERE lesson_id = ? AND source_hash != ?", (_now(), lesson_id, transcript_hash(text)))
         row = conn.execute("SELECT * FROM lessons WHERE id = ? AND deleted_at IS NULL", (lesson_id,)).fetchone()
     return _to_lesson(row)
 
@@ -389,3 +404,88 @@ def update_lesson_details(lesson_id: int, subject_id: int, title: str) -> Lesson
             raise StorageError("Лекция не найдена или сейчас обрабатывается.")
         row = conn.execute("SELECT * FROM lessons WHERE id = ?", (lesson_id,)).fetchone()
     return _to_lesson(row)
+
+
+@dataclass(frozen=True)
+class NotesState:
+    status: str = 'idle'
+    source_hash: str = ''
+    model: str | None = None
+    error_message: str | None = None
+    updated_at: str | None = None
+
+
+@dataclass(frozen=True)
+class NotesClaim:
+    lesson: Lesson
+    job_id: str
+
+
+def transcript_hash(text: str) -> str:
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+
+def get_notes_state(lesson_id: int) -> NotesState:
+    get_lesson(lesson_id)
+    with _connect() as conn:
+        row = conn.execute('SELECT status, source_hash, model, error_message, updated_at FROM notes_state WHERE lesson_id = ?', (lesson_id,)).fetchone()
+    return NotesState(**dict(row)) if row else NotesState()
+
+
+def claim_lesson_for_notes(lesson_id: int) -> NotesClaim:
+    with _connect() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        row = conn.execute('SELECT * FROM lessons WHERE id = ? AND deleted_at IS NULL', (lesson_id,)).fetchone()
+        if row is None:
+            raise NotFoundError('Лекция не найдена.')
+        lesson = _to_lesson(row)
+        existing_job = conn.execute("SELECT status FROM notes_state WHERE lesson_id = ?", (lesson_id,)).fetchone()
+        if lesson.status == STATUS_PROCESSING or (existing_job and existing_job['status'] == 'processing'):
+            raise StorageError('Лекция уже обрабатывается. Дождитесь завершения.')
+        if not lesson.transcript or not lesson.transcript.strip():
+            raise StorageError('Сначала сохраните расшифровку лекции.')
+        job_id = uuid.uuid4().hex
+        conn.execute('UPDATE lessons SET status = ?, error_message = NULL, updated_at = ? WHERE id = ?', (STATUS_PROCESSING, _now(), lesson_id))
+        conn.execute("""INSERT INTO notes_state (lesson_id, status, source_hash, model, job_id, error_message, updated_at)
+            VALUES (?, 'processing', ?, NULL, ?, NULL, ?)
+            ON CONFLICT(lesson_id) DO UPDATE SET status='processing', source_hash=excluded.source_hash,
+            job_id=excluded.job_id, error_message=NULL, updated_at=excluded.updated_at""",
+            (lesson_id, transcript_hash(lesson.transcript), job_id, _now()))
+    return NotesClaim(lesson, job_id)
+
+
+def save_lesson_summary(lesson_id: int, markdown: str, *, source_transcript: str,
+                        model: str | None = None, job_id: str | None = None) -> Lesson:
+    text = _clean_text(markdown, 'Конспект')
+    with _connect() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        row = conn.execute('SELECT * FROM lessons WHERE id = ? AND deleted_at IS NULL', (lesson_id,)).fetchone()
+        if row is None:
+            raise NotFoundError('Лекция не найдена.')
+        if not source_transcript.strip() or row['transcript'] != source_transcript:
+            raise StorageError('Расшифровка изменилась. Создайте конспект заново по актуальному тексту.')
+        state = conn.execute('SELECT * FROM notes_state WHERE lesson_id = ?', (lesson_id,)).fetchone()
+        if job_id is not None:
+            if state is None or state['job_id'] != job_id or state['status'] != 'processing':
+                raise StorageError('Эта задача конспекта больше не активна. Её результат не сохранён.')
+        elif row['status'] == STATUS_PROCESSING or (state and state['status'] == 'processing'):
+            raise StorageError('Дождитесь завершения обработки лекции.')
+        actual_model = model or (state['model'] if state else None)
+        conn.execute('UPDATE lessons SET summary = ?, status = ?, error_message = NULL, updated_at = ? WHERE id = ?', (text, STATUS_COMPLETED, _now(), lesson_id))
+        conn.execute("""INSERT INTO notes_state (lesson_id, status, source_hash, model, updated_at)
+            VALUES (?, 'completed', ?, ?, ?)
+            ON CONFLICT(lesson_id) DO UPDATE SET status='completed', source_hash=excluded.source_hash,
+            model=excluded.model, job_id=NULL, error_message=NULL, updated_at=excluded.updated_at""",
+            (lesson_id, transcript_hash(source_transcript), actual_model, _now()))
+        row = conn.execute('SELECT * FROM lessons WHERE id = ?', (lesson_id,)).fetchone()
+    return _to_lesson(row)
+
+
+def fail_notes_job(claim: NotesClaim, message: str, *, cancelled=False) -> None:
+    with _connect() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        cursor = conn.execute("UPDATE notes_state SET status = ?, job_id = NULL, error_message = ?, updated_at = ? WHERE lesson_id = ? AND job_id = ? AND status = 'processing'",
+                              ('cancelled' if cancelled else 'failed', message, _now(), claim.lesson.id, claim.job_id))
+        if cursor.rowcount:
+            conn.execute('UPDATE lessons SET status = ?, error_message = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL AND status = ?',
+                         (claim.lesson.status, claim.lesson.error_message, _now(), claim.lesson.id, STATUS_PROCESSING))
