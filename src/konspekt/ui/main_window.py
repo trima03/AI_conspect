@@ -47,7 +47,6 @@ class MainWindow(QMainWindow):
         self.resize(1100, 720)
         self.setMinimumSize(900, 600)
 
-        # Страницы (позже заглушки заменим настоящими).
         self._home_page = HomePage()
         self._lessons_page = LessonsPage()
         self._search_page = LessonsPage(title="Поиск")

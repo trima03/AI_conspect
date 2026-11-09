@@ -2,6 +2,8 @@
 
 Приложение для аудиозаписей занятий и расшифровок по предметам.
 
+[Руководство](docs/index.md) · [Выпуски](https://github.com/trima03/AI_conspect/releases) · [Сообщить об ошибке](https://github.com/trima03/AI_conspect/issues/new)
+
 ## Что работает
 
 - Интерфейс PySide6: главная страница, предметы с лекциями, добавление лекции, список всех лекций, записи и корзина.
@@ -46,13 +48,14 @@ transcribe-lesson lecture.m4a --model turbo --reduce-noise --output transcripts/
 В Terminal или терминале PyCharm:
 
 ```bash
-cd /Users/tim/PycharmProjects/AI_conspect-git
+git clone https://github.com/trima03/AI_conspect.git
+cd AI_conspect
+python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e ".[desktop,mac,notes-mac]"
 python run_app.py
 ```
 
-При установке с нуля сначала создайте окружение: `python3 -m venv .venv`.
 В PyCharm выберите интерпретатор `.venv/bin/python`, затем запустите `run_app.py`
 или общую конфигурацию **AIKonspekt** из папки `.run`.
 
@@ -72,6 +75,8 @@ MLX требует Mac с Apple Silicon и macOS 14+.
 
 Для готовой записи используйте «Загрузить аудиофайл» → «Распознать».
 Результат можно открыть повторно на главной странице или в «Все лекции».
+Если текст уже есть, вставьте его на вкладке «Расшифровка» или нажмите
+«Импорт расшифровки TXT», выберите предмет и сохраните лекцию без аудио.
 
 Модели скачиваются с Hugging Face при первом запуске. Для Turbo на Apple Silicon
 используется компактная версия 4 bit (~464 МБ): https://huggingface.co/mlx-community/whisper-large-v3-turbo-4bit.
@@ -132,6 +137,7 @@ summarize-lesson transcripts/lesson.txt --title "Законы Ньютона" --
 ## Предметы, записи и удаление
 
 «Предметы» показывает лекции выбранного предмета, включая записи ещё без текста.
+Кнопка «Переименовать» меняет название выбранного предмета, сохраняя его лекции.
 Через «+ Лекция в этом предмете» предмет уже выбран в форме. Чтобы сохранить аудио
 без распознавания, нажмите «Сохранить лекцию». В окне существующей лекции можно
 изменить предмет или название и сохранить.

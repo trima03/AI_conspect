@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ai-conspect"
 version = "0.1.0"
-description = "Speech transcription prototype for AI_conspect"
+description = "Local desktop app for lecture transcription and AI notes"
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.26", "imageio-ffmpeg>=0.6,<1", "sounddevice>=0.5,<1"]
 

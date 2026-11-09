@@ -137,6 +137,9 @@ class AudioDialog(QDialog):
         self.reset.clicked.connect(self._reset_processing)
         controls.addWidget(self.reset)
         root.addLayout(controls)
+        self.import_text = QPushButton("Импорт расшифровки TXT")
+        self.import_text.clicked.connect(self._import_transcript)
+        controls.addWidget(self.import_text)
         self.text = QTextEdit()
         self.text.setPlaceholderText("Здесь появится расшифровка. Её можно будет исправить и сохранить.")
         self.tabs = QTabWidget()
@@ -206,7 +209,9 @@ class AudioDialog(QDialog):
             if notes_state.error_message:
                 self.notes_hint.setText(notes_state.error_message)
             self.reset.setVisible(lesson.status == storage.STATUS_PROCESSING)
-            self.state.setText(lesson.error_message or "Аудиозапись сохранена. Можно запустить распознавание повторно.")
+            self.state.setText(lesson.error_message or (
+                "Аудиозапись сохранена." if self.source else "Лекция сохранена без аудио."
+            ))
         if lesson_id is None and source_path:
             self._set_source(Path(source_path))
         self._busy(False)
@@ -243,6 +248,28 @@ class AudioDialog(QDialog):
             self._set_source(Path(path))
             self._busy(False)
 
+    def _import_transcript(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Выберите расшифровку UTF-8", "", "Текст (*.txt)")
+        if not path:
+            return
+        try:
+            with Path(path).open(encoding="utf-8-sig") as source:
+                text = source.read(1_000_001)
+            if len(text) > 1_000_000 or not text.strip():
+                raise ValueError("Нужен непустой текст длиной до миллиона символов.")
+        except (OSError, ValueError) as error:
+            self.state.setText(f"Не удалось импортировать текст: {error}")
+            return
+        if self.text.toPlainText().strip() and QMessageBox.question(
+            self, "Заменить расшифровку?", "Заменить текст в редакторе содержимым файла?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self.text.setPlainText(text)
+        if not self.title.text().strip():
+            self.title.setText(Path(path).stem)
+
     def _validate(self):
         if self.subjects.currentData() is None or not self.title.text().strip():
             self.state.setText("Выберите или создайте предмет и укажите название лекции.")
@@ -265,7 +292,8 @@ class AudioDialog(QDialog):
         self.make_notes.setEnabled(not busy and bool(self.text.toPlainText().strip()))
         self.save_notes.setEnabled(not busy and self.lesson_id is not None and bool(self.notes.toPlainText().strip()))
         self.transcribe.setEnabled(not busy and self.source is not None)
-        self.save.setEnabled(not busy and (existing or self.source is not None))
+        self.import_text.setEnabled(not busy)
+        self.save.setEnabled(not busy and (existing or self.source is not None or bool(self.text.toPlainText().strip())))
         self.delete_lesson.setEnabled(not busy and existing)
         self.delete_audio.setEnabled(not busy and self.source is not None)
         self.play.setEnabled(not busy and self.source is not None and self.source.is_file())
@@ -317,6 +345,11 @@ class AudioDialog(QDialog):
     def _transcribe(self):
         if not self._validate() or self.source is None:
             return
+        if (self.text.toPlainText().strip() != self._loaded_transcript
+                or self.notes.document().isModified()) and not self._confirm_replace(
+                    "При успешном распознавании несохранённые правки будут заменены."
+                ):
+            return
         lesson_id, source = self.lesson_id, self.source
         subject_id, title = self.subjects.currentData(), self.title.text().strip()
         model, prompt = self.models.currentData(), self.context.text().strip() or None
@@ -327,9 +360,9 @@ class AudioDialog(QDialog):
                 job.lesson_id = lesson.id
             else:
                 stored = storage.get_lesson(lesson_id)
+                storage.update_lesson_details(lesson_id, subject_id, title)
                 if not stored.audio_path or Path(stored.audio_path).resolve() != source.resolve():
                     lesson_audio.attach_audio_to_lesson(lesson_id, source, max_size_bytes=MAX_FILE_BYTES)
-                storage.update_lesson_details(lesson_id, subject_id, title)
                 job.lesson_id = lesson_id
             return transcribe_lesson(job.lesson_id, model=model, prompt=prompt,
                                      cancel_event=job.stop_event, progress=job.message.emit, reduce_noise=reduce_noise)
@@ -358,10 +391,12 @@ class AudioDialog(QDialog):
         else:
             self.lesson_id = job.result.id
             self._set_source(Path(job.result.audio_path) if job.result.audio_path else None)
+            previous_transcript = self._loaded_transcript
             self.text.setPlainText(job.result.transcript or "")
             self._loaded_transcript = job.result.transcript or ""
             self._notes_source = job.result.transcript or ""
-            self.notes.setMarkdown(job.result.summary or "")
+            if self._notes_source != previous_transcript:
+                self.notes.setMarkdown(job.result.summary or "")
             self.state.setText("Расшифровка сохранена. Конспект можно создать на вкладке «Конспект».")
         self._busy(False)
         self.lesson_changed.emit()
@@ -390,25 +425,43 @@ class AudioDialog(QDialog):
             except Exception as error:
                 self.state.setText(str(error))
 
+    def _confirm_replace(self, text):
+        return QMessageBox.question(
+            self, "Несохранённые правки", text,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) == QMessageBox.StandardButton.Yes
+
     def _save(self):
         if not self._validate():
             return False
+        transcript = self.text.toPlainText().strip()
+        if not transcript and self._loaded_transcript:
+            self.state.setText("Расшифровка пуста. Для сохранения добавьте текст.")
+            return False
+        if transcript != self._loaded_transcript and self.notes.document().isModified():
+            if not self._confirm_replace("Изменение расшифровки сбросит прежний конспект и его несохранённые правки."):
+                return False
         try:
+            created_from_text = self.lesson_id is None and self.source is None
             if self.lesson_id is None:
                 if self.source is None:
-                    return False
-                lesson = lesson_audio.create_lesson_with_audio(self.subjects.currentData(), self.title.text().strip(), self.source, max_size_bytes=MAX_FILE_BYTES)
+                    if not transcript:
+                        return False
+                    lesson = storage.create_lesson(self.subjects.currentData(), self.title.text(), None, transcript=transcript)
+                else:
+                    lesson = lesson_audio.create_lesson_with_audio(self.subjects.currentData(), self.title.text().strip(), self.source, max_size_bytes=MAX_FILE_BYTES)
                 self.lesson_id = lesson.id
-                self._set_source(Path(lesson.audio_path))
+                self._set_source(Path(lesson.audio_path) if lesson.audio_path else None)
             else:
                 stored = storage.get_lesson(self.lesson_id)
+                storage.update_lesson_details(self.lesson_id, self.subjects.currentData(), self.title.text())
                 if self.source is not None and (not stored.audio_path or Path(stored.audio_path).resolve() != self.source.resolve()):
                     lesson = lesson_audio.attach_audio_to_lesson(self.lesson_id, self.source, max_size_bytes=MAX_FILE_BYTES)
                     self._set_source(Path(lesson.audio_path))
-                storage.update_lesson_details(self.lesson_id, self.subjects.currentData(), self.title.text())
             self._replace_audio = self.source is None
-            if self.text.toPlainText().strip():
-                storage.save_lesson_transcript(self.lesson_id, self.text.toPlainText())
+            if transcript and transcript != self._loaded_transcript and not created_from_text:
+                storage.save_lesson_transcript(self.lesson_id, transcript)
             stored = storage.get_lesson(self.lesson_id)
             if self._loaded_transcript != (stored.transcript or ""):
                 self.notes.setMarkdown(stored.summary or "")
@@ -464,9 +517,12 @@ class AudioDialog(QDialog):
         on_notes = self.tabs.currentIndex() == 1
         self.audio_panel.setVisible(not on_notes)
         self.transcribe.setVisible(not on_notes)
+        self.import_text.setVisible(not on_notes)
         self.lesson_heading.setVisible(on_notes)
         self.lesson_heading.setText(self.title.text() or "Конспект лекции")
         self.save.setVisible(not on_notes)
+        self.save.setEnabled(idle and (self.lesson_id is not None or self.source is not None
+                                      or bool(self.text.toPlainText().strip())))
         self.export.setText("Экспорт конспекта" if on_notes else "Экспорт расшифровки")
         self.make_notes.setEnabled(idle and bool(self.text.toPlainText().strip()))
         self.save_notes.setEnabled(idle and self.lesson_id is not None and bool(self.notes.toPlainText().strip()))
@@ -478,6 +534,9 @@ class AudioDialog(QDialog):
         if not self.text.toPlainText().strip():
             self.state.setText("Сначала получите расшифровку лекции.")
             return
+        if self.notes.document().isModified() and self.text.toPlainText().strip() == self._loaded_transcript:
+            if not self._confirm_replace("При успешной генерации несохранённые правки конспекта будут заменены."):
+                return
         if not self._save():
             return
         lesson_id, style = self.lesson_id, self.notes_style.currentData()
@@ -495,6 +554,7 @@ class AudioDialog(QDialog):
             if self.text.toPlainText().strip() != self._notes_source:
                 raise storage.StorageError("Расшифровка изменена. Сохраните её и создайте конспект заново.")
             storage.save_lesson_summary(self.lesson_id, self.notes.toMarkdown(), source_transcript=self._notes_source)
+            self.notes.document().setModified(False)
             self.notes_hint.setText("Правки конспекта сохранены.")
             self.lesson_changed.emit()
         except Exception as error:
@@ -516,6 +576,9 @@ class AudioDialog(QDialog):
         if self.job is not None:
             self.state.setText("Сначала остановите запись или отмените обработку и дождитесь завершения.")
             return
+        if self.text.toPlainText().strip() != self._loaded_transcript or self.notes.document().isModified():
+            if not self._confirm_replace("Закрыть лекцию без сохранения правок текста или конспекта?"):
+                return
         super().reject()
 
     def closeEvent(self, event):

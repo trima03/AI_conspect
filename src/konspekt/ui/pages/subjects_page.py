@@ -1,6 +1,6 @@
 """Subjects with their real saved lessons, including queued/failed recordings."""
 from PySide6.QtCore import Signal, QSignalBlocker, Qt
-from PySide6.QtWidgets import QComboBox, QHBoxLayout, QInputDialog, QLabel, QPushButton, QVBoxLayout
+from PySide6.QtWidgets import QComboBox, QHBoxLayout, QInputDialog, QLabel, QMessageBox, QPushButton, QVBoxLayout
 
 from ... import storage
 from ..formatting import format_datetime
@@ -27,6 +27,9 @@ class SubjectsPage(ScrollPage):
         self.add_lesson.clicked.connect(self._add_lesson)
         row.addWidget(self.subjects, 1)
         row.addWidget(add)
+        self.rename = QPushButton('Переименовать')
+        self.rename.clicked.connect(self._rename_subject)
+        row.addWidget(self.rename)
         row.addWidget(self.add_lesson)
         self.body.addLayout(row)
         self.rows = QVBoxLayout()
@@ -44,6 +47,7 @@ class SubjectsPage(ScrollPage):
             if index >= 0:
                 self.subjects.setCurrentIndex(index)
         self.add_lesson.setEnabled(self.subjects.count() > 0)
+        self.rename.setEnabled(self.subjects.count() > 0)
         self._show_lessons()
 
     def _show_lessons(self, index=None):
@@ -75,8 +79,20 @@ class SubjectsPage(ScrollPage):
                 self.subjects.setCurrentIndex(self.subjects.findData(subject.id))
                 self.changed.emit()
             except Exception as error:
-                from PySide6.QtWidgets import QMessageBox
                 QMessageBox.warning(self, 'Предмет', str(error))
+
+    def _rename_subject(self):
+        subject_id = self.subjects.currentData()
+        if subject_id is None:
+            return
+        try:
+            current = storage.get_subject(subject_id)
+            name, ok = QInputDialog.getText(self, 'Переименование', 'Название:', text=current.name)
+            if ok:
+                storage.rename_subject(subject_id, name)
+                self.changed.emit()
+        except storage.StorageError as error:
+            QMessageBox.warning(self, 'Предмет', str(error))
 
     def _add_lesson(self):
         if self.subjects.currentData() is not None:

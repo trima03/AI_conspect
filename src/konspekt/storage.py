@@ -240,6 +240,20 @@ def create_subject(name: str) -> Subject:
     return _to_subject(row)
 
 
+def rename_subject(subject_id: int, name: str) -> None:
+    cleaned = _clean_text(name, "Название предмета")
+    with _connect() as conn:
+        try:
+            updated = conn.execute(
+                "UPDATE subjects SET name = ?, name_key = ? WHERE id = ?",
+                (cleaned, cleaned.casefold(), subject_id),
+            )
+        except sqlite3.IntegrityError:
+            raise DuplicateSubjectError(f"Предмет «{cleaned}» уже существует.") from None
+        if not updated.rowcount:
+            raise NotFoundError(f"Предмет с номером {subject_id} не найден.")
+
+
 def list_subjects() -> list[Subject]:
     """Все предметы в порядке создания."""
     with _connect() as conn:
@@ -261,10 +275,14 @@ def get_subject(subject_id: int) -> Subject:
 # --- Уроки ---------------------------------------------------------------
 
 
-def create_lesson(subject_id: int, title: str, audio_path: str | Path, *, recording_path: str | None = None) -> Lesson:
-    """Создаёт урок со статусом queued."""
+def create_lesson(subject_id: int, title: str, audio_path: str | Path | None, *, recording_path: str | None = None,
+                  transcript: str | None = None) -> Lesson:
+    """Создаёт урок из аудио или готовой расшифровки."""
     cleaned_title = _clean_text(title, "Название урока")
-    cleaned_path = _clean_text(str(audio_path), "Путь к аудиофайлу")
+    text = _clean_text(transcript, "Расшифровка") if transcript is not None else None
+    if audio_path is None and text is None:
+        raise StorageError("Выберите аудио или добавьте расшифровку.")
+    cleaned_path = _clean_text(str(audio_path), "Путь к аудиофайлу") if audio_path is not None else ""
 
     with _connect() as conn:
         subject = conn.execute(
@@ -276,8 +294,9 @@ def create_lesson(subject_id: int, title: str, audio_path: str | Path, *, record
         now = _now()
         cursor = conn.execute(
             "INSERT INTO lessons (subject_id, title, audio_path, status, "
-            "created_at, updated_at, recording_path) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (subject_id, cleaned_title, cleaned_path, STATUS_QUEUED, now, now, recording_path),
+            "created_at, updated_at, recording_path, transcript) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (subject_id, cleaned_title, cleaned_path, STATUS_COMPLETED if text else STATUS_QUEUED,
+             now, now, recording_path, text),
         )
         row = conn.execute(
             "SELECT * FROM lessons WHERE id = ? AND deleted_at IS NULL", (cursor.lastrowid,)
@@ -383,7 +402,9 @@ def save_lesson_transcript(lesson_id: int, transcript: str) -> Lesson:
     with _connect() as conn:
         cursor = conn.execute(
             "UPDATE lessons SET summary = CASE WHEN transcript = ? THEN summary ELSE NULL END, "
-            "transcript = ?, status = CASE WHEN transcript = ? AND status = ? THEN status ELSE ? END, "
+            "transcript = ?, status = CASE WHEN transcript = ? AND status = ? "
+            "AND EXISTS (SELECT 1 FROM notes_state WHERE lesson_id = lessons.id AND status = 'processing') "
+            "THEN status ELSE ? END, "
             "error_message = NULL, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
             (text, text, text, STATUS_PROCESSING, STATUS_COMPLETED, _now(), lesson_id),
         )
